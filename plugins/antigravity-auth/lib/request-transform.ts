@@ -39,7 +39,7 @@ export const PRIMARY_ENDPOINT = ANTIGRAVITY_ENDPOINTS[0];
 
 // Headers for different quota types
 export const ANTIGRAVITY_HEADERS: AntigravityHeaders = {
-    'User-Agent': 'antigravity/1.11.5 windows/amd64',
+    'User-Agent': 'antigravity/1.15.8 windows/amd64',
     'X-Goog-Api-Client': 'google-cloud-sdk vscode_cloudshelleditor/0.1',
     'Client-Metadata': '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
 };
