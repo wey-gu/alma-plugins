@@ -18,6 +18,13 @@ const CACHE_TTL_MS = 30 * 60 * 1000;
 const MAX_CACHE_SIZE = 1000;
 
 /**
+ * Minimum valid signature length.
+ * Signatures shorter than this are considered invalid/corrupted.
+ * Matches Antigravity-Manager's MIN_SIGNATURE_LENGTH constant.
+ */
+export const MIN_SIGNATURE_LENGTH = 50;
+
+/**
  * Generate a cache key from session ID and thinking text.
  * We use a hash of the text to keep keys manageable.
  */
@@ -94,4 +101,13 @@ export function clearSessionCache(sessionId: string): void {
  */
 export function clearAllCache(): void {
     signatureCache.clear();
+}
+
+/**
+ * Validate if a signature meets minimum length requirements.
+ * Returns true if signature is valid, false otherwise.
+ */
+export function isValidSignature(signature: string | undefined | null): boolean {
+    if (!signature) return false;
+    return signature.length >= MIN_SIGNATURE_LENGTH;
 }

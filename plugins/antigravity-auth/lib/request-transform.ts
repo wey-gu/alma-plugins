@@ -20,7 +20,7 @@ import type {
     AntigravityHeaders,
 } from './types';
 import { getModelFamily, isClaudeThinkingModel, parseModelWithTier, isImageModel, parseImageAspectRatio, parseImageSize } from './models';
-import { cacheSignature, getCachedSignature } from './signature-cache';
+import { cacheSignature, getCachedSignature, isValidSignature, MIN_SIGNATURE_LENGTH } from './signature-cache';
 import { sanitizeToolsForAntigravity } from './schema-sanitizer';
 import { analyzeConversationState, closeToolLoopForThinking, needsThinkingRecovery } from './thinking-recovery';
 
@@ -108,10 +108,16 @@ export function mapToPhysicalModel(model: string): string {
  * Claude requires a signature for thinking blocks in multi-turn conversations.
  * We try to restore signatures from cache; if not found, we strip the thinking block.
  *
+ * [FIX] Added signature length validation (MIN_SIGNATURE_LENGTH = 50) to match
+ * Antigravity-Manager's thinking_utils.rs. Invalid/corrupted signatures are treated
+ * as missing and will trigger thinking block removal.
+ *
  * Based on opencode-antigravity-auth's filterUnsignedThinkingBlocks.
  */
 function restoreThinkingSignatures(contents: GeminiContent[], sessionId: string): GeminiContent[] {
-    return contents.map(content => {
+    let strippedCount = 0;
+
+    const result = contents.map(content => {
         if (!content.parts) return content;
 
         const processedParts: GeminiPart[] = [];
@@ -123,18 +129,18 @@ function restoreThinkingSignatures(contents: GeminiContent[], sessionId: string)
                 continue;
             }
 
-            // Already has signature - keep as is
-            if (part.thoughtSignature) {
+            // Check if existing signature is valid (meets minimum length)
+            if (part.thoughtSignature && isValidSignature(part.thoughtSignature)) {
                 processedParts.push(part);
                 continue;
             }
 
-            // Try to restore signature from cache
+            // Signature is missing or invalid - try to restore from cache
             const thinkingText = part.text || '';
             if (thinkingText) {
                 const cachedSig = getCachedSignature(sessionId, thinkingText);
-                if (cachedSig) {
-                    // Restore signature
+                if (cachedSig && isValidSignature(cachedSig)) {
+                    // Restore valid signature
                     processedParts.push({
                         ...part,
                         thoughtSignature: cachedSig,
@@ -143,8 +149,9 @@ function restoreThinkingSignatures(contents: GeminiContent[], sessionId: string)
                 }
             }
 
-            // No signature and not in cache - skip this thinking block
-            // (Claude will reject it without a signature)
+            // No valid signature - skip this thinking block
+            // (Claude will reject it without a valid signature)
+            strippedCount++;
         }
 
         // If all parts were filtered out, mark this content for removal
@@ -157,6 +164,12 @@ function restoreThinkingSignatures(contents: GeminiContent[], sessionId: string)
             parts: processedParts,
         };
     }).filter((content): content is GeminiContent => content !== null);
+
+    if (strippedCount > 0) {
+        console.log(`[Antigravity] Stripped ${strippedCount} invalid thinking blocks (signature < ${MIN_SIGNATURE_LENGTH} chars)`);
+    }
+
+    return result;
 }
 
 /**
@@ -219,6 +232,106 @@ function ensureToolIds(contents: GeminiContent[]): GeminiContent[] {
     });
 }
 
+/**
+ * Clean cache_control fields from message parts.
+ *
+ * VS Code and other clients may send back historical messages with cache_control
+ * fields that were added by the server. Claude/Gemini APIs don't accept these
+ * fields in requests, so we need to strip them.
+ *
+ * [FIX] Matches Antigravity-Manager's clean_cache_control_from_messages logic.
+ */
+function cleanCacheControlFromMessages(contents: GeminiContent[]): GeminiContent[] {
+    let totalCleaned = 0;
+
+    const result = contents.map(content => {
+        if (!content.parts) return content;
+
+        const cleanedParts = content.parts.map(part => {
+            // Make a shallow copy to avoid mutating the original
+            const cleanedPart = { ...part };
+
+            // Remove cache_control if present (it can appear on any part type)
+            if ('cacheControl' in cleanedPart) {
+                delete (cleanedPart as Record<string, unknown>).cacheControl;
+                totalCleaned++;
+            }
+            if ('cache_control' in cleanedPart) {
+                delete (cleanedPart as Record<string, unknown>).cache_control;
+                totalCleaned++;
+            }
+
+            return cleanedPart;
+        });
+
+        return { ...content, parts: cleanedParts };
+    });
+
+    if (totalCleaned > 0) {
+        console.log(`[Antigravity] Cleaned ${totalCleaned} cache_control fields from messages`);
+    }
+
+    return result;
+}
+
+/**
+ * Sort parts in model messages to ensure thinking blocks come first.
+ *
+ * Claude/Anthropic API requires thinking blocks to appear before other content
+ * blocks in assistant messages. Context compression tools like Kilo may reorder
+ * blocks, causing API errors. This function ensures correct ordering.
+ *
+ * [FIX] Triple-stage partition: [Thinking, Text, ToolUse]
+ * Matches Antigravity-Manager's sort_thinking_blocks_first logic.
+ */
+function sortThinkingBlocksFirst(contents: GeminiContent[]): GeminiContent[] {
+    return contents.map(content => {
+        // Only process model (assistant) messages
+        if (content.role !== 'model') return content;
+        if (!content.parts || content.parts.length <= 1) return content;
+
+        // Partition blocks into categories
+        const thinkingBlocks: GeminiPart[] = [];
+        const textBlocks: GeminiPart[] = [];
+        const toolBlocks: GeminiPart[] = [];
+        const otherBlocks: GeminiPart[] = [];
+
+        let needsReorder = false;
+        let sawNonThinking = false;
+
+        for (const part of content.parts) {
+            const isThinking = part.thought === true;
+            const isToolCall = 'functionCall' in part && part.functionCall !== undefined;
+
+            if (isThinking) {
+                thinkingBlocks.push(part);
+                if (sawNonThinking) {
+                    needsReorder = true;
+                }
+            } else if (isToolCall) {
+                toolBlocks.push(part);
+                sawNonThinking = true;
+            } else if ('text' in part) {
+                textBlocks.push(part);
+                sawNonThinking = true;
+            } else {
+                otherBlocks.push(part);
+                sawNonThinking = true;
+            }
+        }
+
+        // Only reorder if necessary
+        if (!needsReorder) return content;
+
+        // Reconstruct: [Thinking] -> [Text] -> [ToolUse] -> [Other]
+        const sortedParts = [...thinkingBlocks, ...textBlocks, ...toolBlocks, ...otherBlocks];
+
+        console.log(`[Antigravity] Reordered ${content.parts.length} parts in model message: ${thinkingBlocks.length} thinking, ${textBlocks.length} text, ${toolBlocks.length} tool`);
+
+        return { ...content, parts: sortedParts };
+    });
+}
+
 // ============================================================================
 // Request Transformation
 // ============================================================================
@@ -277,13 +390,21 @@ export function transformRequest(
     const isThinking = isClaudeThinkingModel(requestedModel);
     const streaming = isStreamingRequest(originalUrl);
 
-    // Restore thinking signatures from cache for Claude models
+    // Process message contents for Claude models
     // Claude requires signatures for thinking blocks in multi-turn conversations
     // We use sessionId from the request or generate one
     const sessionId = geminiRequest.sessionId || `alma-${Date.now()}`;
     if (isClaude && geminiRequest.contents) {
+        // Step 1: Clean cache_control fields (VS Code etc. may send these back)
+        geminiRequest.contents = cleanCacheControlFromMessages(geminiRequest.contents);
+
+        // Step 2: Sort thinking blocks first in model messages (required by Claude)
+        geminiRequest.contents = sortThinkingBlocksFirst(geminiRequest.contents);
+
+        // Step 3: Restore thinking signatures from cache
         geminiRequest.contents = restoreThinkingSignatures(geminiRequest.contents, sessionId);
-        // Ensure all functionCall/functionResponse parts have matching IDs (required by Claude)
+
+        // Step 4: Ensure all functionCall/functionResponse parts have matching IDs (required by Claude)
         geminiRequest.contents = ensureToolIds(geminiRequest.contents);
     }
 
