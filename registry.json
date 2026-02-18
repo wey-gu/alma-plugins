@@ -120,6 +120,23 @@
             "downloads": 0,
             "rating": 0,
             "featured": true
+        },
+        {
+            "id": "nowledge-mem",
+            "name": "Nowledge Mem",
+            "version": "0.2.13",
+            "description": "Local-first personal memory for Alma, powered by Nowledge Mem",
+            "author": {
+                "name": "Nowledge Labs",
+                "url": "https://mem.nowledge.co/"
+            },
+            "type": ["tool"],
+            "tags": ["memory", "knowledge", "recall", "graph", "local-first"],
+            "repository": "https://github.com/yetone/alma-plugins",
+            "path": "plugins/nowledge-mem",
+            "downloads": 0,
+            "rating": 0,
+            "featured": false
         }
     ]
 }
