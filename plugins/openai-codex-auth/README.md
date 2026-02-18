@@ -5,15 +5,20 @@ Use your ChatGPT Plus/Pro subscription to access OpenAI Codex models directly in
 ## Features
 
 - **OAuth Authentication**: Secure OAuth2 PKCE flow to authenticate with your ChatGPT account
-- **22 Model Variants**: Access GPT-5.2, GPT-5.2 Codex, GPT-5.1 Codex, and more
+- **30+ Model Variants**: Access GPT-5.3, GPT-5.3 Codex, GPT-5.2, GPT-5.2 Codex, GPT-5.1 Codex, and more
 - **Reasoning Control**: Different reasoning effort levels (none, low, medium, high, xhigh)
 - **Streaming Support**: Real-time streaming responses
 
 ## Supported Models
 
+### GPT-5.3 Series
+- `gpt-5.3` - General purpose (6 reasoning variants: none, low, medium, high, xhigh)
+- `gpt-5.3-codex` - Most capable agentic coding model (4 reasoning variants)
+- `gpt-5.3-codex-spark` - Real-time coding, 1000+ tok/s (2 reasoning variants)
+
 ### GPT-5.2 Series
 - `gpt-5.2` - General purpose (5 reasoning variants)
-- `gpt-5.2-codex` - Optimized for coding (4 reasoning variants, 272K context)
+- `gpt-5.2-codex` - Optimized for coding (4 reasoning variants)
 
 ### GPT-5.1 Series
 - `gpt-5.1-codex-max` - Maximum capability (4 reasoning variants)

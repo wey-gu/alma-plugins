@@ -71,6 +71,59 @@ export const CODEX_MODELS: CodexModelInfo[] = [
     },
 
     // -------------------------------------------------------------------------
+    // GPT-5.3 General (6 variants - supports none/low/medium/high/xhigh)
+    // -------------------------------------------------------------------------
+    {
+        id: 'gpt-5.3',
+        name: 'GPT-5.3',
+        description: 'GPT-5.3 general purpose model',
+        baseModel: 'gpt-5.3',
+        reasoning: 'none',
+        contextWindow: 400000,
+        maxOutputTokens: 128000,
+    },
+    {
+        id: 'gpt-5.3-low',
+        name: 'GPT-5.3 (Low Reasoning)',
+        baseModel: 'gpt-5.3',
+        reasoning: 'low',
+        contextWindow: 400000,
+        maxOutputTokens: 128000,
+    },
+    {
+        id: 'gpt-5.3-medium',
+        name: 'GPT-5.3 (Medium Reasoning)',
+        baseModel: 'gpt-5.3',
+        reasoning: 'medium',
+        contextWindow: 400000,
+        maxOutputTokens: 128000,
+    },
+    {
+        id: 'gpt-5.3-high',
+        name: 'GPT-5.3 (High Reasoning)',
+        baseModel: 'gpt-5.3',
+        reasoning: 'high',
+        contextWindow: 400000,
+        maxOutputTokens: 128000,
+    },
+    {
+        id: 'gpt-5.3-xhigh',
+        name: 'GPT-5.3 (XHigh Reasoning)',
+        baseModel: 'gpt-5.3',
+        reasoning: 'xhigh',
+        contextWindow: 400000,
+        maxOutputTokens: 128000,
+    },
+    {
+        id: 'gpt-5.3-none',
+        name: 'GPT-5.3 (No Reasoning)',
+        baseModel: 'gpt-5.3',
+        reasoning: 'none',
+        contextWindow: 400000,
+        maxOutputTokens: 128000,
+    },
+
+    // -------------------------------------------------------------------------
     // GPT-5.2 General (5 variants)
     // -------------------------------------------------------------------------
     {
