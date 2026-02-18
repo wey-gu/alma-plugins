@@ -489,7 +489,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     const providerDisposable = providers.register({
         id: 'openai-codex',
         name: 'OpenAI Codex (ChatGPT)',
-        description: 'Access GPT-5.2 Codex and other models via your ChatGPT subscription',
+        description: 'Access GPT-5.3 Codex and other models via your ChatGPT subscription',
         authType: 'oauth',
 
         async initialize() {

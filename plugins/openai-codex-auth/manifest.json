@@ -1,8 +1,8 @@
 {
     "id": "openai-codex-auth",
     "name": "OpenAI Codex Auth",
-    "version": "1.1.1",
-    "description": "Use ChatGPT Plus/Pro subscription with Alma via OAuth. Access GPT-5.2 Codex and other models directly from your ChatGPT subscription.",
+    "version": "1.2.0",
+    "description": "Use ChatGPT Plus/Pro subscription with Alma via OAuth. Access GPT-5.3 Codex and other models directly from your ChatGPT subscription.",
     "author": {
         "name": "Alma Community"
     },
