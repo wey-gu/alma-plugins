@@ -90,6 +90,8 @@ export function mapToPhysicalModel(model: string): string {
     switch (model) {
         case 'gemini-3-pro-preview':
             return 'gemini-3-pro-high';  // Preview maps back to High
+        case 'gemini-3.1-pro-preview':
+            return 'gemini-3.1-pro-high';  // Preview maps back to High
         case 'gemini-3-pro-image-preview':
             return 'gemini-3-pro-image';
         case 'gemini-3-flash-preview':

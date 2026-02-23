@@ -60,6 +60,11 @@ const MODEL_MAPPING: Record<string, string> = {
     'gemini-2.5-flash': 'gemini-2.5-flash',
     'gemini-3-flash': 'gemini-3-flash',
     'gemini-3-pro-image': 'gemini-3-pro-image',
+    // Gemini 3.1 Pro variants all map to gemini-3.1-pro-preview (matching Antigravity-Manager)
+    'gemini-3.1-pro-preview': 'gemini-3.1-pro-preview',
+    'gemini-3.1-pro': 'gemini-3.1-pro-preview',
+    'gemini-3.1-pro-low': 'gemini-3.1-pro-preview',
+    'gemini-3.1-pro-high': 'gemini-3.1-pro-preview',
     'gemini-2.0-flash-exp': 'gemini-2.0-flash-exp',
     // Note: gemini-2.5-pro removed (matching Antigravity-Manager)
 };
@@ -173,6 +178,8 @@ export function getAllDynamicModelIds(): string[] {
     modelIds.add('gemini-2.5-flash');
     modelIds.add('gemini-3-flash');
     modelIds.add('gemini-3-pro-high');
+    modelIds.add('gemini-3.1-pro-low');
+    modelIds.add('gemini-3.1-pro-high');
 
     // 4. Generate all Image Gen Combinations (Issue #247)
     const base = 'gemini-3-pro-image';
@@ -568,6 +575,46 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
         id: 'gemini-3-flash',
         name: 'Gemini 3 Flash',
         baseModel: 'gemini-3-flash',
+        family: 'gemini',
+        contextWindow: 1048576,
+        maxOutputTokens: 65536,
+    },
+
+    // -------------------------------------------------------------------------
+    // Gemini 3.1 Models
+    // All Gemini 3.1 Pro variants map to gemini-3.1-pro-preview (matching Antigravity-Manager)
+    // -------------------------------------------------------------------------
+    {
+        id: 'gemini-3.1-pro',
+        name: 'Gemini 3.1 Pro',
+        description: 'Maps to Gemini 3.1 Pro Preview',
+        baseModel: 'gemini-3.1-pro-preview',
+        family: 'gemini',
+        contextWindow: 1048576,
+        maxOutputTokens: 65536,
+    },
+    {
+        id: 'gemini-3.1-pro-low',
+        name: 'Gemini 3.1 Pro Low',
+        description: 'Maps to Gemini 3.1 Pro Preview',
+        baseModel: 'gemini-3.1-pro-preview',
+        family: 'gemini',
+        contextWindow: 1048576,
+        maxOutputTokens: 65536,
+    },
+    {
+        id: 'gemini-3.1-pro-high',
+        name: 'Gemini 3.1 Pro High',
+        description: 'Maps to Gemini 3.1 Pro Preview',
+        baseModel: 'gemini-3.1-pro-preview',
+        family: 'gemini',
+        contextWindow: 1048576,
+        maxOutputTokens: 65536,
+    },
+    {
+        id: 'gemini-3.1-pro-preview',
+        name: 'Gemini 3.1 Pro Preview',
+        baseModel: 'gemini-3.1-pro-preview',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
