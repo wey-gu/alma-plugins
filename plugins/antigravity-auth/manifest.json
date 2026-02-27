@@ -1,7 +1,7 @@
 {
     "id": "antigravity-auth",
     "name": "Antigravity Auth",
-    "version": "1.15.1",
+    "version": "1.15.2",
     "description": "Use Google's Antigravity IDE subscription with Alma via OAuth. Access Claude and Gemini models directly from your Antigravity subscription.",
     "author": {
         "name": "Alma Community"
@@ -17,6 +17,9 @@
         "network:domain:accounts.google.com",
         "network:domain:oauth2.googleapis.com",
         "network:domain:googleapis.com",
+        "network:domain:antigravity.google",
+        "network:domain:www.antigravity.google",
+        "network:domain:antigravity-auto-updater-974169037036.us-central1.run.app",
         "network:domain:daily-cloudcode-pa.sandbox.googleapis.com",
         "network:domain:autopush-cloudcode-pa.sandbox.googleapis.com",
         "network:domain:cloudcode-pa.googleapis.com",

@@ -3,6 +3,8 @@
  * This mirrors the implementation in Antigravity-Manager.
  */
 
+import { getAntigravityUserAgent } from './version';
+
 const CLOUD_CODE_BASE_URL = 'https://cloudcode-pa.googleapis.com';
 const QUOTA_API_URL = `${CLOUD_CODE_BASE_URL}/v1internal:fetchAvailableModels`;
 const LOAD_CODE_ASSIST_URL = `${CLOUD_CODE_BASE_URL}/v1internal:loadCodeAssist`;
@@ -61,7 +63,7 @@ async function fetchSubscriptionTier(accessToken: string): Promise<SubscriptionT
             headers: {
                 'Authorization': `Bearer ${accessToken}`,
                 'Content-Type': 'application/json',
-                'User-Agent': 'antigravity/1.18.3 windows/amd64',
+                'User-Agent': getAntigravityUserAgent('windows/amd64'),
             },
             body: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } }),
         });
@@ -97,7 +99,7 @@ export async function fetchQuota(accessToken: string, projectId: string): Promis
             headers: {
                 'Authorization': `Bearer ${accessToken}`,
                 'Content-Type': 'application/json',
-                'User-Agent': 'antigravity/1.18.3 Darwin/arm64',
+                'User-Agent': getAntigravityUserAgent('darwin/arm64'),
             },
             body: JSON.stringify({ project: projectId }),
         }),

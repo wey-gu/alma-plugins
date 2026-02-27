@@ -23,6 +23,7 @@ import { getModelFamily, isClaudeThinkingModel, parseModelWithTier, isImageModel
 import { cacheSignature, getCachedSignature, isValidSignature, MIN_SIGNATURE_LENGTH } from './signature-cache';
 import { sanitizeToolsForAntigravity } from './schema-sanitizer';
 import { analyzeConversationState, closeToolLoopForThinking, needsThinkingRecovery } from './thinking-recovery';
+import { getAntigravityUserAgent } from './version';
 
 // ============================================================================
 // Constants
@@ -38,11 +39,13 @@ export const ANTIGRAVITY_ENDPOINTS = [
 export const PRIMARY_ENDPOINT = ANTIGRAVITY_ENDPOINTS[0];
 
 // Headers for different quota types
-export const ANTIGRAVITY_HEADERS: AntigravityHeaders = {
-    'User-Agent': 'antigravity/1.18.3 windows/amd64',
-    'X-Goog-Api-Client': 'google-cloud-sdk vscode_cloudshelleditor/0.1',
-    'Client-Metadata': '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
-};
+export function getAntigravityHeaders(): AntigravityHeaders {
+    return {
+        'User-Agent': getAntigravityUserAgent('windows/amd64'),
+        'X-Goog-Api-Client': 'google-cloud-sdk vscode_cloudshelleditor/0.1',
+        'Client-Metadata': '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
+    };
+}
 
 export const GEMINI_CLI_HEADERS: AntigravityHeaders = {
     'User-Agent': 'google-api-nodejs-client/9.15.1',
@@ -557,7 +560,7 @@ You are pair programming with a USER to solve their coding task. The task may re
     headers.set('Authorization', `Bearer ${accessToken}`);
     headers.set('Content-Type', 'application/json');
 
-    const selectedHeaders = headerStyle === 'gemini-cli' ? GEMINI_CLI_HEADERS : ANTIGRAVITY_HEADERS;
+    const selectedHeaders = headerStyle === 'gemini-cli' ? GEMINI_CLI_HEADERS : getAntigravityHeaders();
     headers.set('User-Agent', selectedHeaders['User-Agent']);
     headers.set('X-Goog-Api-Client', selectedHeaders['X-Goog-Api-Client']);
     headers.set('Client-Metadata', selectedHeaders['Client-Metadata']);
