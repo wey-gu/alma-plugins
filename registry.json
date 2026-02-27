@@ -128,8 +128,9 @@
             "description": "Local-first personal memory for Alma, powered by Nowledge Mem",
             "author": {
                 "name": "Nowledge Labs",
-                "url": "https://mem.nowledge.co/"
+                "url": "https://nowledge-labs.ai"
             },
+            "homepage": "https://mem.nowledge.co",
             "type": ["tool"],
             "tags": ["memory", "knowledge", "recall", "graph", "local-first"],
             "repository": "https://github.com/yetone/alma-plugins",
