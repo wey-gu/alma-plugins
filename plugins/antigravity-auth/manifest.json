@@ -1,7 +1,7 @@
 {
     "id": "antigravity-auth",
     "name": "Antigravity Auth",
-    "version": "1.15.0",
+    "version": "1.15.1",
     "description": "Use Google's Antigravity IDE subscription with Alma via OAuth. Access Claude and Gemini models directly from your Antigravity subscription.",
     "author": {
         "name": "Alma Community"
