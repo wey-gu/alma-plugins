@@ -48,6 +48,7 @@ export interface QuotaData {
     models: ModelQuota[];
     lastUpdated: number;
     subscriptionTier?: SubscriptionTier;
+    availableModelKeys?: string[];
 }
 
 /**
@@ -130,5 +131,6 @@ export async function fetchQuota(accessToken: string, projectId: string): Promis
         models,
         lastUpdated: Date.now(),
         subscriptionTier,
+        availableModelKeys: Object.keys(data.models),
     };
 }

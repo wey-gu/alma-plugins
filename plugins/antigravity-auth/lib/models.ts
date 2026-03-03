@@ -52,11 +52,11 @@ const MODEL_MAPPING: Record<string, string> = {
     // Gemini protocol mapping
     'gemini-2.5-flash-lite': 'gemini-2.5-flash-lite',
     'gemini-2.5-flash-thinking': 'gemini-2.5-flash-thinking',
-    // Gemini 3 Pro variants all map to gemini-3-pro-preview (matching Antigravity-Manager)
-    'gemini-3-pro-low': 'gemini-3-pro-preview',
-    'gemini-3-pro-high': 'gemini-3-pro-preview',
-    'gemini-3-pro-preview': 'gemini-3-pro-preview',
-    'gemini-3-pro': 'gemini-3-pro-preview',
+    // Gemini 3 Pro variants all map to gemini-3.1-pro-preview (Gemini 3 Pro is deprecated)
+    'gemini-3-pro-low': 'gemini-3.1-pro-preview',
+    'gemini-3-pro-high': 'gemini-3.1-pro-preview',
+    'gemini-3-pro-preview': 'gemini-3.1-pro-preview',
+    'gemini-3-pro': 'gemini-3.1-pro-preview',
     'gemini-2.5-flash': 'gemini-2.5-flash',
     'gemini-3-flash': 'gemini-3-flash',
     'gemini-3-pro-image': 'gemini-3-pro-image',
@@ -200,7 +200,7 @@ export function getAllDynamicModelIds(): string[] {
 // Model Definitions
 // ============================================================================
 
-export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
+const DEFAULT_MODELS: AntigravityModelInfo[] = [
     // -------------------------------------------------------------------------
     // Claude Models (Thinking variants)
     // Budgets based on opencode-antigravity-auth: { low: 8192, medium: 16384, high: 32768 }
@@ -533,14 +533,14 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     },
 
     // -------------------------------------------------------------------------
-    // Gemini 3.0 Models
-    // All Gemini 3 Pro variants map to gemini-3-pro-preview (matching Antigravity-Manager)
+    // Gemini 3.0 Models (deprecated, remapped to Gemini 3.1 Pro)
+    // All Gemini 3 Pro variants map to gemini-3.1-pro-preview (Gemini 3 Pro is deprecated)
     // -------------------------------------------------------------------------
     {
         id: 'gemini-3-pro',
         name: 'Gemini 3 Pro',
-        description: 'Maps to Gemini 3 Pro Preview',
-        baseModel: 'gemini-3-pro-preview',
+        description: 'Maps to Gemini 3.1 Pro Preview (Gemini 3 Pro deprecated)',
+        baseModel: 'gemini-3.1-pro-preview',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
@@ -548,8 +548,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     {
         id: 'gemini-3-pro-low',
         name: 'Gemini 3 Pro Low',
-        description: 'Maps to Gemini 3 Pro Preview',
-        baseModel: 'gemini-3-pro-preview',
+        description: 'Maps to Gemini 3.1 Pro Preview (Gemini 3 Pro deprecated)',
+        baseModel: 'gemini-3.1-pro-preview',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
@@ -557,8 +557,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     {
         id: 'gemini-3-pro-high',
         name: 'Gemini 3 Pro High',
-        description: 'Maps to Gemini 3 Pro Preview',
-        baseModel: 'gemini-3-pro-preview',
+        description: 'Maps to Gemini 3.1 Pro Preview (Gemini 3 Pro deprecated)',
+        baseModel: 'gemini-3.1-pro-preview',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
@@ -566,7 +566,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     {
         id: 'gemini-3-pro-preview',
         name: 'Gemini 3 Pro Preview',
-        baseModel: 'gemini-3-pro-preview',
+        description: 'Maps to Gemini 3.1 Pro Preview (Gemini 3 Pro deprecated)',
+        baseModel: 'gemini-3.1-pro-preview',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
@@ -683,6 +684,203 @@ function generateImageModels(): AntigravityModelInfo[] {
 }
 
 // ============================================================================
+// Family Defaults for Dynamic Model Building
+// ============================================================================
+
+const CLAUDE_DEFAULTS = { contextWindow: 200000, maxOutputTokens: 8192 };
+const CLAUDE_THINKING_DEFAULTS = { contextWindow: 200000, maxOutputTokens: 65536 };
+const GEMINI_DEFAULTS = { contextWindow: 1048576, maxOutputTokens: 65536 };
+
+// Thinking budget tiers (matches opencode-antigravity-auth)
+const THINKING_BUDGETS: Record<string, { level: ThinkingLevel; budget: number }> = {
+    '-high': { level: 'high', budget: 32768 },
+    '-low': { level: 'low', budget: 8192 },
+};
+
+/**
+ * Generate a human-readable name from a model key.
+ * e.g., "gemini-2.5-flash" → "Gemini 2.5 Flash"
+ * e.g., "claude-sonnet-4-5-thinking" → "Claude Sonnet 4.5 (Thinking)"
+ */
+function generateModelName(modelKey: string): string {
+    // Handle thinking suffix specially
+    let suffix = '';
+    let key = modelKey;
+    if (key.endsWith('-thinking-high')) {
+        suffix = ' (High Thinking)';
+        key = key.replace(/-thinking-high$/, '-thinking');
+    } else if (key.endsWith('-thinking-low')) {
+        suffix = ' (Low Thinking)';
+        key = key.replace(/-thinking-low$/, '-thinking');
+    } else if (key.endsWith('-thinking')) {
+        suffix = ' (Thinking)';
+    }
+
+    // Remove "-thinking" for base name generation
+    const baseName = key.replace(/-thinking$/, '');
+
+    // Capitalize each segment
+    const name = baseName
+        .split('-')
+        .map(segment => {
+            // Keep version numbers as-is (e.g., "4.5", "2.5")
+            if (/^\d/.test(segment)) return segment;
+            return segment.charAt(0).toUpperCase() + segment.slice(1);
+        })
+        .join(' ');
+
+    return name + suffix;
+}
+
+/**
+ * Build model info from an API model key.
+ * First checks DEFAULT_MODELS for exact match (preserving known metadata),
+ * then infers metadata from the key pattern.
+ */
+export function buildModelInfo(modelKey: string): AntigravityModelInfo {
+    // Check if we have an exact match in DEFAULT_MODELS
+    const existing = DEFAULT_MODELS.find(m => m.id === modelKey);
+    if (existing) {
+        return existing;
+    }
+
+    // Infer family from key prefix
+    const family: 'claude' | 'gemini' = modelKey.startsWith('claude') ? 'claude' : 'gemini';
+
+    // Determine thinking config
+    const isThinking = modelKey.includes('thinking');
+    let thinking: ThinkingLevel = 'none';
+    let thinkingBudget: number | undefined;
+
+    if (isThinking) {
+        // Check for tier suffix
+        for (const [tierSuffix, config] of Object.entries(THINKING_BUDGETS)) {
+            if (modelKey.endsWith(tierSuffix)) {
+                thinking = config.level;
+                thinkingBudget = config.budget;
+                break;
+            }
+        }
+        // Default thinking level is medium if no tier suffix
+        if (thinking === 'none') {
+            thinking = 'medium';
+            thinkingBudget = 16384;
+        }
+    }
+
+    // Select family defaults
+    const defaults = family === 'claude'
+        ? (isThinking ? CLAUDE_THINKING_DEFAULTS : CLAUDE_DEFAULTS)
+        : GEMINI_DEFAULTS;
+
+    // Determine base model (strip tier suffix for thinking models)
+    let baseModel = modelKey;
+    if (family === 'claude' && isThinking) {
+        baseModel = modelKey.replace(/-(high|low)$/, '');
+    }
+
+    // Resolve baseModel through MODEL_MAPPING if available
+    const mappedModel = MODEL_MAPPING[baseModel];
+    if (mappedModel) {
+        baseModel = mappedModel;
+    }
+
+    return {
+        id: modelKey,
+        name: generateModelName(modelKey),
+        baseModel,
+        family,
+        thinking: family === 'claude' ? thinking : undefined,
+        thinkingBudget: family === 'claude' ? thinkingBudget : undefined,
+        contextWindow: defaults.contextWindow,
+        maxOutputTokens: defaults.maxOutputTokens,
+    };
+}
+
+/**
+ * Build full model list from API-returned keys.
+ * - Builds model info for each API key
+ * - For Claude thinking models, auto-generates -high/-low variants
+ * - Merges alias models from MODEL_MAPPING
+ * - Merges image model combinations
+ */
+export function buildModelsFromApiKeys(apiKeys: string[]): AntigravityModelInfo[] {
+    const modelMap = new Map<string, AntigravityModelInfo>();
+
+    // 1. Build models from API keys
+    for (const key of apiKeys) {
+        const info = buildModelInfo(key);
+        modelMap.set(info.id, info);
+
+        // Auto-generate -high/-low variants for Claude thinking models
+        if (info.family === 'claude' && info.thinking === 'medium' && info.id.endsWith('-thinking')) {
+            for (const [tierSuffix, config] of Object.entries(THINKING_BUDGETS)) {
+                const variantId = info.id + tierSuffix;
+                if (!modelMap.has(variantId)) {
+                    modelMap.set(variantId, {
+                        ...info,
+                        id: variantId,
+                        name: generateModelName(variantId),
+                        thinking: config.level,
+                        thinkingBudget: config.budget,
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. Merge alias models from MODEL_MAPPING (only those not already present)
+    for (const [aliasId, targetId] of Object.entries(MODEL_MAPPING)) {
+        if (!modelMap.has(aliasId)) {
+            // Build from the alias, using the target's info as base
+            const targetInfo = modelMap.get(targetId);
+            if (targetInfo) {
+                modelMap.set(aliasId, {
+                    ...targetInfo,
+                    id: aliasId,
+                    name: generateModelName(aliasId),
+                    description: `Alias for ${targetInfo.name}`,
+                    baseModel: targetInfo.baseModel,
+                });
+            } else {
+                // Target not in API response; build from alias key directly
+                modelMap.set(aliasId, buildModelInfo(aliasId));
+            }
+        }
+    }
+
+    // 3. Merge image model combinations
+    for (const imageModel of generateImageModels()) {
+        if (!modelMap.has(imageModel.id)) {
+            modelMap.set(imageModel.id, imageModel);
+        }
+    }
+
+    // Sort by id for consistent display
+    return Array.from(modelMap.values()).sort((a, b) => a.id.localeCompare(b.id));
+}
+
+// ============================================================================
+// Model Cache Management
+// ============================================================================
+
+let cachedModels: AntigravityModelInfo[] | null = null;
+
+/**
+ * Set the cached dynamic model list.
+ */
+export function setCachedModels(models: AntigravityModelInfo[]): void {
+    cachedModels = models;
+}
+
+/**
+ * Get the effective model list: cached dynamic models or DEFAULT_MODELS fallback.
+ */
+export function getEffectiveModels(): AntigravityModelInfo[] {
+    return cachedModels ?? DEFAULT_MODELS;
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
@@ -702,7 +900,7 @@ export function stripProviderPrefix(modelId: string): string {
  */
 export function getModelInfo(modelId: string): AntigravityModelInfo | undefined {
     const cleanId = stripProviderPrefix(modelId);
-    return ANTIGRAVITY_MODELS.find((m) => m.id === cleanId);
+    return getEffectiveModels().find((m) => m.id === cleanId);
 }
 
 /**

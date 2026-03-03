@@ -108,7 +108,7 @@
         {
             "id": "antigravity-auth",
             "name": "Antigravity Auth",
-            "version": "1.15.3",
+            "version": "1.16.0",
             "description": "Use Google Antigravity IDE subscription to access Claude and Gemini models via OAuth authentication",
             "author": {
                 "name": "Alma Community"

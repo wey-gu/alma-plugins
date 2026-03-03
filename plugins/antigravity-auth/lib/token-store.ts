@@ -19,6 +19,7 @@ import {
     type SchedulingMode,
 } from './account-manager';
 import { fetchQuota, type QuotaData } from './quota';
+import { buildModelsFromApiKeys, setCachedModels } from './models';
 
 // Storage keys
 const ACCOUNTS_STORAGE_KEY = 'antigravity_accounts';
@@ -677,16 +678,41 @@ export class TokenStore {
         this.logger.info(`Refreshing quotas for ${accounts.length} account(s)...`);
 
         let successCount = 0;
+        let modelKeysCached = false;
         for (const account of accounts) {
             const quota = await this.refreshAccountQuotaInternal(account);
             if (quota) {
                 successCount++;
+                // Cache dynamic model list from the first successful quota response
+                if (!modelKeysCached && quota.availableModelKeys && quota.availableModelKeys.length > 0) {
+                    const models = buildModelsFromApiKeys(quota.availableModelKeys);
+                    setCachedModels(models);
+                    modelKeysCached = true;
+                    this.logger.info(`Cached ${models.length} models from ${quota.availableModelKeys.length} API keys`);
+                }
             }
         }
 
         // Save all at once
         await this.saveAccounts();
         this.logger.info(`Finished refreshing quotas: ${successCount}/${accounts.length} succeeded`);
+    }
+
+    /**
+     * Fetch available model keys from the API.
+     * Refreshes quotas and returns the model keys from the first successful response.
+     */
+    async fetchAvailableModelKeys(): Promise<string[] | undefined> {
+        const accounts = this.accountManager.getAccounts();
+        for (const account of accounts) {
+            const quota = await this.refreshAccountQuotaInternal(account);
+            if (quota?.availableModelKeys && quota.availableModelKeys.length > 0) {
+                await this.saveAccounts();
+                return quota.availableModelKeys;
+            }
+        }
+        await this.saveAccounts();
+        return undefined;
     }
 
     // =========================================================================

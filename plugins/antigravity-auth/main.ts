@@ -16,7 +16,7 @@
 import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 import { TokenStore } from './lib/token-store';
 import { getAuthorizationUrl, exchangeCodeForTokens } from './lib/auth';
-import { ANTIGRAVITY_MODELS, getModelFamily, isClaudeThinkingModel, isImageModel, parseImageAspectRatio } from './lib/models';
+import { getEffectiveModels, getModelFamily, isClaudeThinkingModel, isImageModel, parseImageAspectRatio, buildModelsFromApiKeys, setCachedModels } from './lib/models';
 import type { ManagedAccount, ModelFamily, HeaderStyle } from './lib/account-manager';
 import {
     isGenerativeLanguageRequest,
@@ -450,8 +450,8 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         },
 
         async getModels() {
-            // Return all supported models
-            return ANTIGRAVITY_MODELS.map((model) => ({
+            // Return all supported models (cached dynamic or default fallback)
+            return getEffectiveModels().map((model) => ({
                 id: model.id,
                 name: model.name,
                 description: model.description,
@@ -470,6 +470,39 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     baseModel: model.baseModel,
                 },
             }));
+        },
+
+        async fetchModels() {
+            // Fetch fresh models from API
+            logger.info('Fetching available models from API...');
+            const apiKeys = await tokenStore.fetchAvailableModelKeys();
+            if (apiKeys && apiKeys.length > 0) {
+                const models = buildModelsFromApiKeys(apiKeys);
+                setCachedModels(models);
+                logger.info(`Fetched and cached ${models.length} models from ${apiKeys.length} API keys`);
+                return models.map((model) => ({
+                    id: model.id,
+                    name: model.name,
+                    description: model.description,
+                    contextWindow: model.contextWindow,
+                    maxOutputTokens: model.maxOutputTokens,
+                    capabilities: {
+                        streaming: true,
+                        reasoning: model.reasoning ?? isClaudeThinkingModel(model.id),
+                        functionCalling: model.functionCalling ?? true,
+                        imageOutput: model.imageOutput ?? false,
+                    },
+                    providerOptions: {
+                        family: model.family,
+                        thinking: model.thinking,
+                        thinkingBudget: model.thinkingBudget,
+                        baseModel: model.baseModel,
+                    },
+                }));
+            }
+            logger.warn('Failed to fetch models from API, returning cached/default models');
+            // Fallback to getModels()
+            return this.getModels();
         },
 
         /**
