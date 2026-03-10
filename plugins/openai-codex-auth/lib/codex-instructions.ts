@@ -21,14 +21,17 @@ const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 /**
  * Model family type for prompt selection
  */
-export type ModelFamily = 'gpt-5.3-codex' | 'gpt-5.3' | 'gpt-5.2-codex' | 'codex-max' | 'codex' | 'gpt-5.2' | 'gpt-5.1';
+export type ModelFamily = 'gpt-5.4' | 'gpt-5.3-codex' | 'gpt-5.3' | 'gpt-5.2-codex' | 'codex-max' | 'codex' | 'gpt-5.2' | 'gpt-5.1';
 
 /**
  * Prompt file mapping for each model family
+ * Note: GPT-5.4 and GPT-5.3 use the generic prompt.md since no model-specific
+ * prompt files exist in the Codex CLI releases for these models.
  */
 const PROMPT_FILES: Record<ModelFamily, string> = {
+    'gpt-5.4': 'prompt.md',
     'gpt-5.3-codex': 'gpt-5.3-codex_prompt.md',
-    'gpt-5.3': 'gpt_5_3_prompt.md',
+    'gpt-5.3': 'prompt.md',
     'gpt-5.2-codex': 'gpt-5.2-codex_prompt.md',
     'codex-max': 'gpt-5.1-codex-max_prompt.md',
     codex: 'gpt_5_codex_prompt.md',
@@ -40,6 +43,7 @@ const PROMPT_FILES: Record<ModelFamily, string> = {
  * Cache file mapping for each model family
  */
 const CACHE_FILES: Record<ModelFamily, string> = {
+    'gpt-5.4': 'gpt-5.4-instructions.md',
     'gpt-5.3-codex': 'gpt-5.3-codex-instructions.md',
     'gpt-5.3': 'gpt-5.3-instructions.md',
     'gpt-5.2-codex': 'gpt-5.2-codex-instructions.md',
@@ -65,6 +69,9 @@ interface CacheMetadata {
  */
 export function getModelFamily(normalizedModel: string): ModelFamily {
     // Order matters - check more specific patterns first
+    if (normalizedModel.includes('gpt-5.4') || normalizedModel.includes('gpt 5.4')) {
+        return 'gpt-5.4';
+    }
     if (
         normalizedModel.includes('gpt-5.3-codex') ||
         normalizedModel.includes('gpt 5.3 codex')

@@ -376,16 +376,26 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     // These are cached with ETag for 15 minutes
                     const codexInstructions = await getCodexInstructions(normalizedModel);
 
-                    // Transform to Codex format (matching opencode's transformRequestBody)
+                    // Build reasoning config (matching official Codex CLI's build_responses_request)
+                    const hasReasoning = reasoningEffort !== 'none';
+                    const reasoning = hasReasoning ? {
+                        effort: reasoningEffort,
+                        summary: 'auto',
+                    } : undefined;
+
+                    // Only include reasoning.encrypted_content when reasoning is enabled
+                    // (matches official Codex CLI: `if reasoning.is_some() { vec!["reasoning.encrypted_content"] } else { vec![] }`)
+                    const include = hasReasoning ? ['reasoning.encrypted_content'] : [];
+
+                    // Transform to Codex format (matching official Codex CLI's ResponsesApiRequest)
                     const transformedBody: Record<string, any> = {
                         model: normalizedModel,
                         store: false, // Required: stateless mode (ChatGPT backend REQUIRES this)
                         stream: true, // Always stream for Codex (we convert to JSON if needed)
                         input: filteredInput,
-                        include: ['reasoning.encrypted_content'], // Required for stateless operation
-                        text: {
-                            verbosity: 'medium', // Matches Codex CLI default
-                        },
+                        include,
+                        tool_choice: 'auto', // Required by Codex API (official CLI always sends "auto")
+                        parallel_tool_calls: parsed.parallel_tool_calls ?? true, // Preserve from AI SDK or default true
                     };
 
                     // Set Codex instructions (matching opencode's body.instructions = codexInstructions)
@@ -393,17 +403,27 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                         transformedBody.instructions = codexInstructions;
                     }
 
-                    // Add reasoning config if not 'none'
-                    if (reasoningEffort !== 'none') {
-                        transformedBody.reasoning = {
-                            effort: reasoningEffort,
-                            summary: 'auto',
-                        };
+                    // Add reasoning config if enabled
+                    if (reasoning) {
+                        transformedBody.reasoning = reasoning;
+                    }
+
+                    // Add text controls (verbosity) - only when model supports it
+                    // Official Codex CLI checks model_info.support_verbosity before setting
+                    if (parsed.text) {
+                        transformedBody.text = parsed.text;
+                    } else {
+                        transformedBody.text = { verbosity: 'medium' };
                     }
 
                     // Preserve tools if present
                     if (parsed.tools) {
                         transformedBody.tools = parsed.tools;
+                    }
+
+                    // Preserve prompt_cache_key from AI SDK for cache continuity
+                    if (parsed.prompt_cache_key) {
+                        transformedBody.prompt_cache_key = parsed.prompt_cache_key;
                     }
 
                     // Remove unsupported parameters (matching opencode)

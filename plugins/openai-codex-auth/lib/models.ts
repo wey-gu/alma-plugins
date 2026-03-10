@@ -94,6 +94,51 @@ export function buildModelsFromApiResponse(data: any): CodexModelInfo[] {
 
 export const CODEX_MODELS: CodexModelInfo[] = [
     // -------------------------------------------------------------------------
+    // GPT-5.4 (flagship frontier model - supports none/low/medium/high/xhigh)
+    // -------------------------------------------------------------------------
+    {
+        id: 'gpt-5.4',
+        name: 'GPT-5.4',
+        description: 'GPT-5.4 - flagship frontier model for professional work',
+        baseModel: 'gpt-5.4',
+        reasoning: 'medium',
+        contextWindow: 1050000,
+        maxOutputTokens: 128000,
+    },
+    {
+        id: 'gpt-5.4-none',
+        name: 'GPT-5.4 (No Reasoning)',
+        baseModel: 'gpt-5.4',
+        reasoning: 'none',
+        contextWindow: 1050000,
+        maxOutputTokens: 128000,
+    },
+    {
+        id: 'gpt-5.4-low',
+        name: 'GPT-5.4 (Low Reasoning)',
+        baseModel: 'gpt-5.4',
+        reasoning: 'low',
+        contextWindow: 1050000,
+        maxOutputTokens: 128000,
+    },
+    {
+        id: 'gpt-5.4-high',
+        name: 'GPT-5.4 (High Reasoning)',
+        baseModel: 'gpt-5.4',
+        reasoning: 'high',
+        contextWindow: 1050000,
+        maxOutputTokens: 128000,
+    },
+    {
+        id: 'gpt-5.4-xhigh',
+        name: 'GPT-5.4 (XHigh Reasoning)',
+        baseModel: 'gpt-5.4',
+        reasoning: 'xhigh',
+        contextWindow: 1050000,
+        maxOutputTokens: 128000,
+    },
+
+    // -------------------------------------------------------------------------
     // GPT-5.3 Codex (4 variants - no 'none' reasoning)
     // -------------------------------------------------------------------------
     {
