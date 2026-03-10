@@ -30,7 +30,7 @@ export interface OAuthConfig {
 // Model Types
 // ============================================================================
 
-export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh';
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 
 export interface CodexModelInfo {
     id: string;

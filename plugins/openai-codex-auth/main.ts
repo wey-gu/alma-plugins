@@ -17,7 +17,7 @@
 import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 import { TokenStore } from './lib/token-store';
 import { getAuthorizationUrl, exchangeCodeForTokens } from './lib/auth';
-import { CODEX_MODELS, getBaseModelId, getReasoningEffort } from './lib/models';
+import { getActiveModels, setCachedModels, buildModelsFromApiResponse, getBaseModelId, getReasoningEffort } from './lib/models';
 import { getCodexInstructions } from './lib/codex-instructions';
 import { addAlmaBridgeMessage } from './lib/alma-codex-bridge';
 
@@ -554,9 +554,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         },
 
         async getModels() {
-            // Return all supported models
-            // All Codex models support function calling (tools)
-            return CODEX_MODELS.map(model => ({
+            return getActiveModels().map(model => ({
                 id: model.id,
                 name: model.name,
                 description: model.description,
@@ -565,13 +563,72 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 capabilities: {
                     streaming: true,
                     reasoning: model.reasoning !== 'none',
-                    functionCalling: true, // All Codex models support function calling
+                    functionCalling: true,
                 },
                 providerOptions: {
                     reasoning: model.reasoning,
                     baseModel: model.baseModel,
                 },
             }));
+        },
+
+        async fetchModels() {
+            logger.info('Fetching available models from Codex API...');
+            try {
+                const accessToken = await tokenStore.getValidAccessToken();
+                const accountId = tokenStore.getAccountId();
+                if (!accountId) {
+                    logger.warn('No account ID, returning default models');
+                    return this.getModels();
+                }
+
+                const response = await globalThis.fetch(
+                    `${CODEX_BASE_URL}/codex/models?client_version=1.0.0`,
+                    {
+                        headers: {
+                            'Authorization': `Bearer ${accessToken}`,
+                            [OPENAI_HEADERS.ACCOUNT_ID]: accountId,
+                            [OPENAI_HEADERS.ORIGINATOR]: 'codex_cli_rs',
+                            [OPENAI_HEADERS.BETA]: 'responses=experimental',
+                        },
+                    },
+                );
+
+                if (!response.ok) {
+                    logger.warn(`Failed to fetch models: ${response.status}`);
+                    return this.getModels();
+                }
+
+                const data = await response.json();
+                const models = buildModelsFromApiResponse(data);
+                if (models.length === 0) {
+                    logger.warn('No models found in API response');
+                    return this.getModels();
+                }
+
+                setCachedModels(models);
+                logger.info(`Fetched and cached ${models.length} models from Codex API`);
+
+                return models.map(model => ({
+                    id: model.id,
+                    name: model.name,
+                    description: model.description,
+                    contextWindow: model.contextWindow,
+                    maxOutputTokens: model.maxOutputTokens,
+                    capabilities: {
+                        streaming: true,
+                        reasoning: model.reasoning !== 'none',
+                        functionCalling: true,
+                    },
+                    providerOptions: {
+                        reasoning: model.reasoning,
+                        baseModel: model.baseModel,
+                    },
+                }));
+            } catch (error) {
+                logger.error('Error fetching models:', error);
+                return this.getModels();
+            }
         },
 
         /**

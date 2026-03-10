@@ -1,14 +1,95 @@
 /**
  * Codex Model Definitions
  *
- * Defines all model variants supported by OpenAI Codex via ChatGPT OAuth.
- * Each variant has a specific reasoning effort level.
+ * Supports both hardcoded defaults and dynamic model fetching from API.
+ * Each base model generates reasoning effort variants automatically.
  */
 
 import type { CodexModelInfo, ReasoningEffort } from './types';
 
 // ============================================================================
-// Model Definitions
+// Module Cache
+// ============================================================================
+
+let cachedModels: CodexModelInfo[] | null = null;
+
+/** Get active model list (cached from API or hardcoded defaults) */
+export function getActiveModels(): CodexModelInfo[] {
+    return cachedModels ?? CODEX_MODELS;
+}
+
+/** Set cached models fetched from API */
+export function setCachedModels(models: CodexModelInfo[]): void {
+    cachedModels = models;
+}
+
+// ============================================================================
+// Dynamic Model Building from /codex/models API
+// ============================================================================
+
+const REASONING_LABELS: Record<string, string> = {
+    minimal: 'Minimal Reasoning',
+    none: 'No Reasoning',
+    low: 'Low Reasoning',
+    medium: 'Medium Reasoning',
+    high: 'High Reasoning',
+    xhigh: 'XHigh Reasoning',
+};
+
+/**
+ * Build models from the /backend-api/codex/models API response.
+ * Uses actual API data (slug, display_name, context_window,
+ * supported_reasoning_levels, etc.) instead of guessing.
+ */
+export function buildModelsFromApiResponse(data: any): CodexModelInfo[] {
+    const apiModels: any[] = data?.models ?? [];
+    if (!Array.isArray(apiModels) || apiModels.length === 0) return [];
+
+    const models: CodexModelInfo[] = [];
+
+    for (const m of apiModels) {
+        const slug: string = m.slug;
+        if (!slug) continue;
+
+        const displayName: string = m.display_name || slug;
+        const description: string = m.description || '';
+        const contextWindow: number = m.context_window || 272000;
+        const defaultEffort: ReasoningEffort = (m.default_reasoning_level || 'medium') as ReasoningEffort;
+        const levels: Array<{ effort: string }> = m.supported_reasoning_levels || [];
+
+        // Default variant (with the model's default reasoning level)
+        models.push({
+            id: slug,
+            name: displayName,
+            description,
+            baseModel: slug,
+            reasoning: defaultEffort,
+            contextWindow,
+            maxOutputTokens: 128000,
+        });
+
+        // Additional reasoning variants
+        for (const level of levels) {
+            const effort = level.effort as ReasoningEffort;
+            if (effort === defaultEffort) continue;
+            const label = REASONING_LABELS[effort] || `${effort.charAt(0).toUpperCase()}${effort.slice(1)} Reasoning`;
+
+            models.push({
+                id: `${slug}-${effort}`,
+                name: `${displayName} (${label})`,
+                baseModel: slug,
+                reasoning: effort,
+                contextWindow,
+                maxOutputTokens: 128000,
+            });
+        }
+    }
+
+    return models;
+}
+
+// ============================================================================
+// Default Model Definitions (fallback when API is unavailable)
 // ============================================================================
 
 export const CODEX_MODELS: CodexModelInfo[] = [
@@ -430,10 +511,10 @@ export const CODEX_MODELS: CodexModelInfo[] = [
 // ============================================================================
 
 /**
- * Get model info by ID
+ * Get model info by ID (searches active model list)
  */
 export function getModelInfo(modelId: string): CodexModelInfo | undefined {
-    return CODEX_MODELS.find(m => m.id === modelId);
+    return getActiveModels().find(m => m.id === modelId);
 }
 
 /**
