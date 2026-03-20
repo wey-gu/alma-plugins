@@ -34,18 +34,19 @@ Alma  -->  AI SDK  -->  /v1/chat/completions  -->  Local HTTP proxy
 
 ## Install
 
-Copy `plugins/cursor-auth` directory into your Alma plugins folder, or reference it in your Alma plugin configuration.
+Copy `main.js` and `manifest.json` into `~/.config/alma/plugins/cursor-auth/`. The bundled `main.js` is self-contained with all dependencies included — no `npm install` needed.
 
-### Dependencies
+## Build from source
 
-This plugin requires `@bufbuild/protobuf` for Cursor's gRPC protocol. Install it in the plugin directory:
+If you need to rebuild `main.js` from the TypeScript sources:
 
 ```sh
 cd plugins/cursor-auth
-npm install @bufbuild/protobuf
+bun install
+bun run build
 ```
 
-The `proto/agent_pb.ts` file is generated from Cursor's protobuf schema and included in the plugin.
+This bundles `main.ts` + all `lib/` modules + `proto/agent_pb.ts` + `@bufbuild/protobuf` into a single `main.js`.
 
 ## Authenticate
 
