@@ -1,23 +1,22 @@
 # Cursor Auth Plugin for Alma
 
-Use your Cursor subscription to access Claude, GPT, Gemini, and other models inside Alma with full tool-calling support.
+Use your Cursor subscription to access Claude, GPT, Gemini, and other models inside Alma with full tool-calling and image support.
 
 ## How it works
 
-This follows the same architecture as openai-codex-auth:
-
 1. **OAuth** — Browser-based login to Cursor via PKCE (poll-based).
 2. **Model discovery** — Queries Cursor's gRPC API for all available models.
-3. **Custom fetch** — `getSDKConfig()` returns a custom fetch wrapper that intercepts AI SDK requests and translates OpenAI chat/completions format into Cursor's protobuf/HTTP2 Connect protocol.
-4. **Native tool routing** — Rejects Cursor's built-in filesystem/shell tools and exposes Alma's tool surface via Cursor MCP instead.
+3. **Local proxy** — Starts a local HTTP server that translates OpenAI chat/completions format into Cursor's protobuf/HTTP2 Connect protocol.
+4. **Image support** — Decodes base64 images from AI SDK and passes them to Cursor via `SelectedContext.selectedImages`.
+5. **Native tool routing** — Rejects Cursor's built-in filesystem/shell tools and exposes Alma's tool surface via Cursor MCP instead.
 
 ## Architecture
 
 ```
-Alma  -->  AI SDK  -->  custom fetch  -->  HTTP/2 Connect stream
-                                                  |
-                                           api2.cursor.sh
-                                         /agent.v1.AgentService/Run
+Alma  -->  AI SDK  -->  Local HTTP proxy  -->  HTTP/2 Connect stream
+                        (localhost:PORT)              |
+                                               api2.cursor.sh
+                                             /agent.v1.AgentService/Run
 ```
 
 ### Tool call flow
@@ -25,11 +24,11 @@ Alma  -->  AI SDK  -->  custom fetch  -->  HTTP/2 Connect stream
 ```
 1. Cursor model receives Alma tools via RequestContext (as MCP tool defs)
 2. Model tries native tools (readArgs, shellArgs, etc.)
-3. Custom fetch rejects each with typed error (ReadRejected, ShellRejected, etc.)
+3. Proxy rejects each with typed error (ReadRejected, ShellRejected, etc.)
 4. Model falls back to MCP tool -> mcpArgs exec message
-5. Custom fetch emits OpenAI tool_calls SSE chunk
+5. Proxy emits OpenAI tool_calls SSE chunk
 6. Alma executes tool, sends result in follow-up request
-7. Custom fetch resumes HTTP/2 stream with mcpResult, streams continuation
+7. Proxy resumes HTTP/2 stream with mcpResult, streams continuation
 ```
 
 ## Install
@@ -72,5 +71,9 @@ Models are discovered dynamically from Cursor's API. Fallback list:
 
 ## Requirements
 
-- [Alma](https://github.com/your-org/alma)
+- [Alma](https://github.com/yetone/alma)
 - Active [Cursor](https://cursor.com) subscription
+
+## Credits
+
+This plugin is based on and inspired by [opencode-cursor](https://github.com/ephraimduncan/opencode-cursor) by [@ephraimduncan](https://github.com/ephraimduncan). The core gRPC protocol translation, protobuf schema, OAuth flow, and proxy architecture are adapted from that project. Thank you for the excellent open-source work!
