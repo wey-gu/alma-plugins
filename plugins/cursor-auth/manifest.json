@@ -1,0 +1,57 @@
+{
+    "id": "cursor-auth",
+    "name": "Cursor Auth",
+    "version": "1.0.0",
+    "description": "Use Cursor subscription with Alma via OAuth. Connects to Cursor's gRPC API with a local OpenAI-compatible proxy.",
+    "author": {
+        "name": "Alma Community"
+    },
+    "main": "main.js",
+    "engines": {
+        "alma": "^0.1.0"
+    },
+    "type": "provider",
+    "permissions": [
+        "network:fetch",
+        "network:localhost",
+        "network:domain:cursor.com",
+        "network:domain:api2.cursor.sh",
+        "providers:manage",
+        "notifications",
+        "storage:secrets"
+    ],
+    "activationEvents": [
+        "onStartup"
+    ],
+    "contributes": {
+        "providers": [
+            {
+                "id": "cursor",
+                "name": "Cursor",
+                "authType": "oauth"
+            }
+        ],
+        "commands": [
+            {
+                "id": "cursor-auth.login",
+                "title": "Login to Cursor"
+            },
+            {
+                "id": "cursor-auth.logout",
+                "title": "Logout from Cursor"
+            },
+            {
+                "id": "cursor-auth.status",
+                "title": "Cursor Connection Status"
+            }
+        ]
+    },
+    "keywords": [
+        "cursor",
+        "oauth",
+        "proxy",
+        "grpc",
+        "claude",
+        "gpt"
+    ]
+}

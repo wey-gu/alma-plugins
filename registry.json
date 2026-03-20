@@ -122,6 +122,22 @@
             "featured": true
         },
         {
+            "id": "cursor-auth",
+            "name": "Cursor Auth",
+            "version": "1.0.0",
+            "description": "Use Cursor subscription to access Claude, GPT, Gemini and other models via OAuth with a local OpenAI-compatible proxy",
+            "author": {
+                "name": "Alma Community"
+            },
+            "type": ["provider"],
+            "tags": ["cursor", "oauth", "proxy", "grpc", "claude", "gpt", "gemini", "provider"],
+            "repository": "https://github.com/yetone/alma-plugins",
+            "path": "plugins/cursor-auth",
+            "downloads": 0,
+            "rating": 0,
+            "featured": true
+        },
+        {
             "id": "nowledge-mem",
             "name": "Nowledge Mem",
             "version": "0.6.3",
