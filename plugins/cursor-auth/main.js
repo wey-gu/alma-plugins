@@ -4597,25 +4597,27 @@ function createCursorFetch(getAccessToken, logger) {
     } else {
       url = input.url;
     }
-    if (!url.includes("/chat/completions")) {
-      if (url.includes("/models")) {
-        return new Response(JSON.stringify({ object: "list", data: [] }), { headers: { "Content-Type": "application/json" } });
+    const method = init?.method?.toUpperCase() ?? "GET";
+    logger.debug(`Cursor fetch: ${method} ${url}`);
+    if (url.includes("/models")) {
+      return new Response(JSON.stringify({ object: "list", data: [] }), { headers: { "Content-Type": "application/json" } });
+    }
+    if (method === "POST") {
+      try {
+        const bodyStr = typeof init?.body === "string" ? init.body : "";
+        const body = JSON.parse(bodyStr);
+        const accessToken = await getAccessToken();
+        logger.debug(`Cursor request: model=${body.model}, stream=${body.stream}, messages=${body.messages.length}`);
+        return await handleChatCompletion(body, accessToken, logger);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error("Cursor fetch error:", message);
+        return new Response(JSON.stringify({
+          error: { message, type: "server_error", code: "internal_error" }
+        }), { status: 500, headers: { "Content-Type": "application/json" } });
       }
-      return globalThis.fetch(input, init);
     }
-    try {
-      const bodyStr = typeof init?.body === "string" ? init.body : "";
-      const body = JSON.parse(bodyStr);
-      const accessToken = await getAccessToken();
-      logger.debug(`Cursor request: model=${body.model}, stream=${body.stream}, messages=${body.messages.length}`);
-      return await handleChatCompletion(body, accessToken, logger);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.error("Cursor fetch error:", message);
-      return new Response(JSON.stringify({
-        error: { message, type: "server_error", code: "internal_error" }
-      }), { status: 500, headers: { "Content-Type": "application/json" } });
-    }
+    return new Response("{}", { headers: { "Content-Type": "application/json" } });
   };
 }
 function disposeAllSessions() {

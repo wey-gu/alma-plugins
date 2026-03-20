@@ -130,36 +130,46 @@ export function createCursorFetch(
             url = input.url;
         }
 
-        // Only intercept chat completions — pass through everything else
-        if (!url.includes('/chat/completions')) {
-            // Models endpoint — return empty list (models are provided via getModels)
-            if (url.includes('/models')) {
-                return new Response(
-                    JSON.stringify({ object: 'list', data: [] }),
-                    { headers: { 'Content-Type': 'application/json' } },
-                );
-            }
-            return globalThis.fetch(input, init);
-        }
+        const method = init?.method?.toUpperCase() ?? 'GET';
 
-        try {
-            const bodyStr = typeof init?.body === 'string' ? init.body : '';
-            const body = JSON.parse(bodyStr) as ChatCompletionRequest;
-            const accessToken = await getAccessToken();
+        logger.debug(`Cursor fetch: ${method} ${url}`);
 
-            logger.debug(`Cursor request: model=${body.model}, stream=${body.stream}, messages=${body.messages.length}`);
-
-            return await handleChatCompletion(body, accessToken, logger);
-        } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            logger.error('Cursor fetch error:', message);
+        // Models endpoint — return empty list (models are provided via getModels)
+        if (url.includes('/models')) {
             return new Response(
-                JSON.stringify({
-                    error: { message, type: 'server_error', code: 'internal_error' },
-                }),
-                { status: 500, headers: { 'Content-Type': 'application/json' } },
+                JSON.stringify({ object: 'list', data: [] }),
+                { headers: { 'Content-Type': 'application/json' } },
             );
         }
+
+        // Intercept all POST requests as chat completions
+        // AI SDK may call /chat/completions, /completions, /responses, etc.
+        // All of them need to be translated to Cursor's gRPC protocol.
+        // NEVER forward to api2.cursor.sh directly — it's a gRPC server.
+        if (method === 'POST') {
+            try {
+                const bodyStr = typeof init?.body === 'string' ? init.body : '';
+                const body = JSON.parse(bodyStr) as ChatCompletionRequest;
+                const accessToken = await getAccessToken();
+
+                logger.debug(`Cursor request: model=${body.model}, stream=${body.stream}, messages=${body.messages.length}`);
+
+                return await handleChatCompletion(body, accessToken, logger);
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                logger.error('Cursor fetch error:', message);
+                return new Response(
+                    JSON.stringify({
+                        error: { message, type: 'server_error', code: 'internal_error' },
+                    }),
+                    { status: 500, headers: { 'Content-Type': 'application/json' } },
+                );
+            }
+        }
+
+        // For any other request, return empty success instead of forwarding
+        // to Cursor's gRPC server (which would 404)
+        return new Response('{}', { headers: { 'Content-Type': 'application/json' } });
     };
 }
 
