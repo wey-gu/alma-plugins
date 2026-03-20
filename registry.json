@@ -124,8 +124,8 @@
         {
             "id": "cursor-auth",
             "name": "Cursor Auth",
-            "version": "1.2.0",
-            "description": "Use Cursor subscription to access Claude, GPT, Gemini and other models via OAuth with custom fetch gRPC translation",
+            "version": "1.3.0",
+            "description": "Use Cursor subscription to access Claude, GPT, Gemini and other models via OAuth with local OpenAI-compatible proxy",
             "author": {
                 "name": "Alma Community"
             },

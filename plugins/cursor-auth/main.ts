@@ -18,14 +18,9 @@ import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 import { TokenStore } from './lib/token-store';
 import { generateCursorAuthParams, pollCursorAuth, getTokenExpiry } from './lib/auth';
 import { getCursorModels, getFallbackModels } from './lib/models';
-import { createCursorFetch, disposeAllSessions } from './lib/cursor-fetch';
+import { startProxy, stopProxy, createProxyFetch } from './lib/cursor-fetch';
 
-// ============================================================================
-// Constants
-// ============================================================================
-
-const CURSOR_BASE_URL = 'https://api2.cursor.sh';
-const DUMMY_API_KEY = 'cursor-oauth';
+const DUMMY_API_KEY = 'cursor-proxy';
 
 // ============================================================================
 // Plugin Activation
@@ -39,6 +34,18 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     // Initialize token store
     const tokenStore = new TokenStore(storage.secrets, logger);
     await tokenStore.initialize();
+
+    // Proxy port (set when proxy starts)
+    let currentProxyPort: number | undefined;
+
+    const ensureProxy = async (): Promise<number> => {
+        if (currentProxyPort) return currentProxyPort;
+        currentProxyPort = await startProxy(
+            () => tokenStore.getValidAccessToken(),
+            logger,
+        );
+        return currentProxyPort;
+    };
 
     // =========================================================================
     // Register Provider
@@ -93,7 +100,6 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
         async logout() {
             await tokenStore.clearTokens();
-            disposeAllSessions();
             ui.showNotification('Logged out from Cursor', { type: 'info' });
             logger.info('Cursor logout successful');
         },
@@ -144,20 +150,18 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         },
 
         /**
-         * Returns SDK configuration for AI SDK's createOpenAI().
-         * This follows the openai-codex-auth pattern:
-         * - apiKey: Dummy key (actual auth via OAuth)
-         * - baseURL: Cursor API URL (custom fetch intercepts and translates)
-         * - fetch: Custom fetch that handles gRPC translation
+         * Returns SDK configuration for AI SDK.
+         * Follows opencode-cursor's pattern exactly:
+         * - Start local proxy server that translates OpenAI -> Cursor gRPC
+         * - baseURL points to localhost proxy
+         * - fetch strips auth headers (proxy handles auth internally)
          */
         async getSDKConfig() {
+            const port = await ensureProxy();
             return {
                 apiKey: DUMMY_API_KEY,
-                baseURL: CURSOR_BASE_URL,
-                fetch: createCursorFetch(
-                    () => tokenStore.getValidAccessToken(),
-                    logger,
-                ),
+                baseURL: `http://localhost:${port}/v1`,
+                fetch: createProxyFetch(),
             };
         },
     } as any);
@@ -172,7 +176,6 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
     const logoutCommand = commands.register('logout', async () => {
         await tokenStore.clearTokens();
-        disposeAllSessions();
         ui.showNotification('Logged out from Cursor', { type: 'info' });
     });
 
@@ -193,7 +196,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
     return {
         dispose: () => {
-            disposeAllSessions();
+            stopProxy();
             providerDisposable.dispose();
             loginCommand.dispose();
             logoutCommand.dispose();
