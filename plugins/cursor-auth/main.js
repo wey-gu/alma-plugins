@@ -36,6 +36,7 @@ async function generateCursorAuthParams() {
 async function pollCursorAuth(uuid, verifier) {
   let delay = POLL_BASE_DELAY;
   let consecutiveErrors = 0;
+  let lastError;
   for (let attempt = 0;attempt < POLL_MAX_ATTEMPTS; attempt++) {
     await sleep(delay);
     try {
@@ -52,12 +53,15 @@ async function pollCursorAuth(uuid, verifier) {
           refreshToken: data.refreshToken
         };
       }
-      throw new Error(`Poll failed: ${response.status}`);
-    } catch {
+      const errorBody = await response.text().catch(() => '');
+      throw new Error(`Poll failed: ${response.status}${errorBody ? ` - ${errorBody}` : ''}`);
+    } catch (err) {
       consecutiveErrors++;
-      if (consecutiveErrors >= 3) {
-        throw new Error("Too many consecutive errors during Cursor auth polling");
+      lastError = err instanceof Error ? err.message : String(err);
+      if (consecutiveErrors >= 10) {
+        throw new Error(`Too many consecutive errors during Cursor auth polling (last: ${lastError})`);
       }
+      delay = Math.min(delay * POLL_BACKOFF_MULTIPLIER, POLL_MAX_DELAY);
     }
   }
   throw new Error("Cursor authentication polling timeout");

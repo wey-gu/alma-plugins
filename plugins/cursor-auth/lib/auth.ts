@@ -59,6 +59,7 @@ export async function pollCursorAuth(
 ): Promise<{ accessToken: string; refreshToken: string }> {
     let delay = POLL_BASE_DELAY;
     let consecutiveErrors = 0;
+    let lastError: string | undefined;
 
     for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
         await sleep(delay);
@@ -85,14 +86,21 @@ export async function pollCursorAuth(
                 };
             }
 
-            throw new Error(`Poll failed: ${response.status}`);
-        } catch {
+            const errorBody = await response.text().catch(() => '');
+            throw new Error(
+                `Poll failed: ${response.status}${errorBody ? ` - ${errorBody}` : ''}`,
+            );
+        } catch (err) {
             consecutiveErrors++;
-            if (consecutiveErrors >= 3) {
+            lastError =
+                err instanceof Error ? err.message : String(err);
+            if (consecutiveErrors >= 10) {
                 throw new Error(
-                    'Too many consecutive errors during Cursor auth polling',
+                    `Too many consecutive errors during Cursor auth polling (last: ${lastError})`,
                 );
             }
+            // Backoff on errors to give the network/server time to recover
+            delay = Math.min(delay * POLL_BACKOFF_MULTIPLIER, POLL_MAX_DELAY);
         }
     }
 
