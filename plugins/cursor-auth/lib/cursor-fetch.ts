@@ -274,21 +274,33 @@ function handleChatCompletion(
 
 /**
  * Extract text from message content.
- * AI SDK may send content as a string OR as an array of content parts:
- *   "hello"  OR  [{type: "text", text: "hello"}, ...]
- * Without this normalization, arrays become "[object Object]".
+ *
+ * The AI SDK (especially @ai-sdk/openai-compatible) may send content as:
+ *   - string: "hello"
+ *   - array:  [{type: "text", text: "hello"}, {type: "image_url", ...}]
+ *
+ * Cursor's gRPC UserMessage only supports plain text. For non-text parts
+ * (images, files, etc.), we skip them since Cursor can't handle them.
+ * This is the same limitation as opencode-cursor which also only sends text.
  */
 function extractContent(content: unknown): string {
     if (typeof content === 'string') return content;
     if (content == null) return '';
     if (Array.isArray(content)) {
-        return content
-            .map((part: any) => {
-                if (typeof part === 'string') return part;
-                if (typeof part === 'object' && part !== null && typeof part.text === 'string') return part.text;
-                return '';
-            })
-            .join('');
+        const textParts: string[] = [];
+        for (const part of content) {
+            if (typeof part === 'string') {
+                textParts.push(part);
+            } else if (typeof part === 'object' && part !== null) {
+                const p = part as Record<string, unknown>;
+                if (p.type === 'text' && typeof p.text === 'string') {
+                    textParts.push(p.text);
+                }
+                // Non-text parts (image_url, etc.) are intentionally skipped.
+                // Cursor's gRPC protocol (UserMessage) only supports plain text.
+            }
+        }
+        return textParts.join('');
     }
     return String(content);
 }

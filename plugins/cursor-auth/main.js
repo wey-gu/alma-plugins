@@ -4714,13 +4714,18 @@ function extractContent(content) {
   if (content == null)
     return "";
   if (Array.isArray(content)) {
-    return content.map((part) => {
-      if (typeof part === "string")
-        return part;
-      if (typeof part === "object" && part !== null && typeof part.text === "string")
-        return part.text;
-      return "";
-    }).join("");
+    const textParts = [];
+    for (const part of content) {
+      if (typeof part === "string") {
+        textParts.push(part);
+      } else if (typeof part === "object" && part !== null) {
+        const p = part;
+        if (p.type === "text" && typeof p.text === "string") {
+          textParts.push(p.text);
+        }
+      }
+    }
+    return textParts.join("");
   }
   return String(content);
 }
