@@ -126,7 +126,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     input: {
                         text: true,
                         audio: false,
-                        image: false,
+                        image: true,
                         video: false,
                         pdf: false,
                     },

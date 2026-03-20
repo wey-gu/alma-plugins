@@ -4405,6 +4405,8 @@ var ReadRejectedSchema = /* @__PURE__ */ messageDesc(file_agent, 316);
 var RequestContextResultSchema = /* @__PURE__ */ messageDesc(file_agent, 336);
 var RequestContextSuccessSchema = /* @__PURE__ */ messageDesc(file_agent, 337);
 var RequestContextSchema = /* @__PURE__ */ messageDesc(file_agent, 347);
+var SelectedImageSchema = /* @__PURE__ */ messageDesc(file_agent, 349);
+var SelectedContextSchema = /* @__PURE__ */ messageDesc(file_agent, 373);
 var ShellResultSchema = /* @__PURE__ */ messageDesc(file_agent, 389);
 var ShellRejectedSchema = /* @__PURE__ */ messageDesc(file_agent, 400);
 var WriteResultSchema = /* @__PURE__ */ messageDesc(file_agent, 450);
@@ -4674,7 +4676,7 @@ function readBody(req) {
   });
 }
 function handleChatCompletion(body, accessToken, res, logger) {
-  const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+  const { systemPrompt, userText, images, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = body.tools ?? [];
   if (!userText && toolResults.length === 0) {
@@ -4700,7 +4702,7 @@ function handleChatCompletion(body, accessToken, res, logger) {
     activeSessions.delete(sessionKey);
   }
   const mcpTools = buildMcpToolDefinitions(tools);
-  const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
+  const payload = buildCursorRequest(modelId, systemPrompt, userText, images, turns);
   payload.mcpTools = mcpTools;
   if (body.stream === false) {
     handleNonStreaming(payload, accessToken, modelId, res);
@@ -4710,11 +4712,12 @@ function handleChatCompletion(body, accessToken, res, logger) {
 }
 function extractContent(content) {
   if (typeof content === "string")
-    return content;
+    return { text: content, images: [] };
   if (content == null)
-    return "";
+    return { text: "", images: [] };
   if (Array.isArray(content)) {
     const textParts = [];
+    const images = [];
     for (const part of content) {
       if (typeof part === "string") {
         textParts.push(part);
@@ -4722,18 +4725,42 @@ function extractContent(content) {
         const p = part;
         if (p.type === "text" && typeof p.text === "string") {
           textParts.push(p.text);
+        } else if (p.type === "image_url" && p.image_url?.url) {
+          const parsed = parseDataUrl(p.image_url.url);
+          if (parsed)
+            images.push(parsed);
+        } else if (p.type === "image" && p.image) {
+          const url = typeof p.image === "string" ? p.image : p.image.url;
+          if (url) {
+            const parsed = parseDataUrl(url);
+            if (parsed)
+              images.push(parsed);
+          }
         }
       }
     }
-    return textParts.join("");
+    return { text: textParts.join(""), images };
   }
-  return String(content);
+  return { text: String(content), images: [] };
+}
+function parseDataUrl(url) {
+  if (url.startsWith("data:")) {
+    const match = url.match(/^data:([^;]+);base64,(.+)$/);
+    if (match) {
+      return {
+        mimeType: match[1],
+        data: new Uint8Array(Buffer.from(match[2], "base64"))
+      };
+    }
+  }
+  return null;
 }
 function parseMessages(messages) {
   let systemPrompt = "You are a helpful assistant.";
   const pairs = [];
   const toolResults = [];
-  const systemParts = messages.filter((m) => m.role === "system").map((m) => extractContent(m.content));
+  let images = [];
+  const systemParts = messages.filter((m) => m.role === "system").map((m) => extractContent(m.content).text);
   if (systemParts.length > 0)
     systemPrompt = systemParts.join(`
 `);
@@ -4741,14 +4768,16 @@ function parseMessages(messages) {
   let pendingUser = "";
   for (const msg of nonSystem) {
     if (msg.role === "tool") {
-      toolResults.push({ toolCallId: msg.tool_call_id ?? "", content: extractContent(msg.content) });
+      toolResults.push({ toolCallId: msg.tool_call_id ?? "", content: extractContent(msg.content).text });
     } else if (msg.role === "user") {
       if (pendingUser)
         pairs.push({ userText: pendingUser, assistantText: "" });
-      pendingUser = extractContent(msg.content);
+      const parsed = extractContent(msg.content);
+      pendingUser = parsed.text;
+      images = parsed.images;
     } else if (msg.role === "assistant") {
       if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: extractContent(msg.content) });
+        pairs.push({ userText: pendingUser, assistantText: extractContent(msg.content).text });
         pendingUser = "";
       }
     }
@@ -4760,7 +4789,7 @@ function parseMessages(messages) {
     const last = pairs.pop();
     lastUserText = last.userText;
   }
-  return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
+  return { systemPrompt, userText: lastUserText, images, turns: pairs, toolResults };
 }
 function buildMcpToolDefinitions(tools) {
   return tools.map((t) => {
@@ -4782,7 +4811,7 @@ function decodeMcpArgsMap(args) {
     decoded[key] = decodeMcpArgValue(value);
   return decoded;
 }
-function buildCursorRequest(modelId, systemPrompt, userText, turns) {
+function buildCursorRequest(modelId, systemPrompt, userText, images, turns) {
   const blobStore = new Map;
   const turnBytes = [];
   for (const turn of turns) {
@@ -4817,6 +4846,14 @@ function buildCursorRequest(modelId, systemPrompt, userText, turns) {
     readPaths: []
   });
   const userMessage = create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() });
+  if (images.length > 0) {
+    const selectedImages = images.map((img) => create(SelectedImageSchema, {
+      uuid: crypto.randomUUID(),
+      mimeType: img.mimeType,
+      dataOrBlobId: { case: "data", value: img.data }
+    }));
+    userMessage.selectedContext = create(SelectedContextSchema, { selectedImages });
+  }
   const action = create(ConversationActionSchema, { action: { case: "userMessageAction", value: create(UserMessageActionSchema, { userMessage }) } });
   const modelDetails = create(ModelDetailsSchema, { modelId, displayModelId: modelId, displayName: modelId });
   const runRequest = create(AgentRunRequestSchema, { conversationState, action, modelDetails, conversationId: crypto.randomUUID() });
@@ -5225,7 +5262,7 @@ async function activate(context) {
           input: {
             text: true,
             audio: false,
-            image: false,
+            image: true,
             video: false,
             pdf: false
           },

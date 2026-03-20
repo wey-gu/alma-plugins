@@ -50,6 +50,9 @@ import {
     McpToolResultContentItemSchema,
     ModelDetailsSchema,
     ReadRejectedSchema,
+    SelectedContextSchema,
+    SelectedImageSchema,
+    SelectedImage_DimensionSchema,
     ReadResultSchema,
     RequestContextResultSchema,
     RequestContextSchema,
@@ -231,7 +234,7 @@ function handleChatCompletion(
     res: http.ServerResponse,
     logger: Logger,
 ): void {
-    const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+    const { systemPrompt, userText, images, turns, toolResults } = parseMessages(body.messages);
     const modelId = body.model;
     const tools = body.tools ?? [];
 
@@ -258,7 +261,7 @@ function handleChatCompletion(
     }
 
     const mcpTools = buildMcpToolDefinitions(tools);
-    const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
+    const payload = buildCursorRequest(modelId, systemPrompt, userText, images, turns);
     payload.mcpTools = mcpTools;
 
     if (body.stream === false) {
@@ -272,45 +275,90 @@ function handleChatCompletion(
 // Message Parsing
 // ============================================================================
 
+interface ImageData {
+    data: Uint8Array;
+    mimeType: string;
+}
+
+interface ParsedContent {
+    text: string;
+    images: ImageData[];
+}
+
 /**
- * Extract text from message content.
+ * Extract text and images from message content.
  *
- * The AI SDK (especially @ai-sdk/openai-compatible) may send content as:
+ * The AI SDK may send content as:
  *   - string: "hello"
- *   - array:  [{type: "text", text: "hello"}, {type: "image_url", ...}]
+ *   - array:  [{type: "text", text: "hello"}, {type: "image_url", image_url: {url: "data:..."}}]
  *
- * Cursor's gRPC UserMessage only supports plain text. For non-text parts
- * (images, files, etc.), we skip them since Cursor can't handle them.
- * This is the same limitation as opencode-cursor which also only sends text.
+ * Cursor supports images via UserMessage.selectedContext.selectedImages,
+ * using raw bytes in the SelectedImage.data field.
  */
-function extractContent(content: unknown): string {
-    if (typeof content === 'string') return content;
-    if (content == null) return '';
+function extractContent(content: unknown): ParsedContent {
+    if (typeof content === 'string') return { text: content, images: [] };
+    if (content == null) return { text: '', images: [] };
     if (Array.isArray(content)) {
         const textParts: string[] = [];
+        const images: ImageData[] = [];
         for (const part of content) {
             if (typeof part === 'string') {
                 textParts.push(part);
             } else if (typeof part === 'object' && part !== null) {
-                const p = part as Record<string, unknown>;
+                const p = part as Record<string, any>;
                 if (p.type === 'text' && typeof p.text === 'string') {
                     textParts.push(p.text);
+                } else if (p.type === 'image_url' && p.image_url?.url) {
+                    const parsed = parseDataUrl(p.image_url.url);
+                    if (parsed) images.push(parsed);
+                } else if (p.type === 'image' && p.image) {
+                    // Alternative image format
+                    const url = typeof p.image === 'string' ? p.image : p.image.url;
+                    if (url) {
+                        const parsed = parseDataUrl(url);
+                        if (parsed) images.push(parsed);
+                    }
                 }
-                // Non-text parts (image_url, etc.) are intentionally skipped.
-                // Cursor's gRPC protocol (UserMessage) only supports plain text.
             }
         }
-        return textParts.join('');
+        return { text: textParts.join(''), images };
     }
-    return String(content);
+    return { text: String(content), images: [] };
 }
 
-function parseMessages(messages: OpenAIMessage[]): { systemPrompt: string; userText: string; turns: Array<{ userText: string; assistantText: string }>; toolResults: ToolResultInfo[] } {
+/**
+ * Parse a data: URL into raw bytes and mime type.
+ * Supports: data:image/png;base64,... and plain https:// URLs (skipped).
+ */
+function parseDataUrl(url: string): ImageData | null {
+    if (url.startsWith('data:')) {
+        const match = url.match(/^data:([^;]+);base64,(.+)$/);
+        if (match) {
+            return {
+                mimeType: match[1],
+                data: new Uint8Array(Buffer.from(match[2], 'base64')),
+            };
+        }
+    }
+    // TODO: support https:// URLs by fetching them
+    return null;
+}
+
+interface ParsedMessages {
+    systemPrompt: string;
+    userText: string;
+    images: ImageData[];
+    turns: Array<{ userText: string; assistantText: string }>;
+    toolResults: ToolResultInfo[];
+}
+
+function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     let systemPrompt = 'You are a helpful assistant.';
     const pairs: Array<{ userText: string; assistantText: string }> = [];
     const toolResults: ToolResultInfo[] = [];
+    let images: ImageData[] = [];
 
-    const systemParts = messages.filter((m) => m.role === 'system').map((m) => extractContent(m.content));
+    const systemParts = messages.filter((m) => m.role === 'system').map((m) => extractContent(m.content).text);
     if (systemParts.length > 0) systemPrompt = systemParts.join('\n');
 
     const nonSystem = messages.filter((m) => m.role !== 'system');
@@ -318,12 +366,15 @@ function parseMessages(messages: OpenAIMessage[]): { systemPrompt: string; userT
 
     for (const msg of nonSystem) {
         if (msg.role === 'tool') {
-            toolResults.push({ toolCallId: msg.tool_call_id ?? '', content: extractContent(msg.content) });
+            toolResults.push({ toolCallId: msg.tool_call_id ?? '', content: extractContent(msg.content).text });
         } else if (msg.role === 'user') {
             if (pendingUser) pairs.push({ userText: pendingUser, assistantText: '' });
-            pendingUser = extractContent(msg.content);
+            const parsed = extractContent(msg.content);
+            pendingUser = parsed.text;
+            // Collect images from the latest user message
+            images = parsed.images;
         } else if (msg.role === 'assistant') {
-            if (pendingUser) { pairs.push({ userText: pendingUser, assistantText: extractContent(msg.content) }); pendingUser = ''; }
+            if (pendingUser) { pairs.push({ userText: pendingUser, assistantText: extractContent(msg.content).text }); pendingUser = ''; }
         }
     }
 
@@ -331,7 +382,7 @@ function parseMessages(messages: OpenAIMessage[]): { systemPrompt: string; userT
     if (pendingUser) { lastUserText = pendingUser; }
     else if (pairs.length > 0 && toolResults.length === 0) { const last = pairs.pop()!; lastUserText = last.userText; }
 
-    return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
+    return { systemPrompt, userText: lastUserText, images, turns: pairs, toolResults };
 }
 
 // ============================================================================
@@ -362,7 +413,7 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
 // gRPC Request Building
 // ============================================================================
 
-function buildCursorRequest(modelId: string, systemPrompt: string, userText: string, turns: Array<{ userText: string; assistantText: string }>): CursorRequestPayload {
+function buildCursorRequest(modelId: string, systemPrompt: string, userText: string, images: ImageData[], turns: Array<{ userText: string; assistantText: string }>): CursorRequestPayload {
     const blobStore = new Map<string, Uint8Array>();
     const turnBytes: Uint8Array[] = [];
 
@@ -392,7 +443,18 @@ function buildCursorRequest(modelId: string, systemPrompt: string, userText: str
         subagentStates: {}, selfSummaryCount: 0, readPaths: [],
     });
 
+    // Build UserMessage with optional image support via selectedContext
     const userMessage = create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() });
+    if (images.length > 0) {
+        const selectedImages = images.map((img) =>
+            create(SelectedImageSchema, {
+                uuid: crypto.randomUUID(),
+                mimeType: img.mimeType,
+                dataOrBlobId: { case: 'data', value: img.data },
+            })
+        );
+        userMessage.selectedContext = create(SelectedContextSchema, { selectedImages });
+    }
     const action = create(ConversationActionSchema, { action: { case: 'userMessageAction', value: create(UserMessageActionSchema, { userMessage }) } });
     const modelDetails = create(ModelDetailsSchema, { modelId, displayModelId: modelId, displayName: modelId });
     const runRequest = create(AgentRunRequestSchema, { conversationState, action, modelDetails, conversationId: crypto.randomUUID() });
