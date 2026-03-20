@@ -69,6 +69,22 @@ Models are discovered dynamically from Cursor's API. Fallback list:
 | cursor-small | No | 200K |
 | gemini-2.5-pro | Yes | 1M |
 
+## Troubleshooting
+
+### Plugin not updating after changes
+
+Alma caches compiled plugins as `.mjs` files. If you update the plugin but Alma still uses old code, clear the cache and restart:
+
+```sh
+rm -f ~/Library/Application\ Support/alma/plugin-cache/*.mjs
+```
+
+Then restart Alma.
+
+### Model responds with `[object Object]`
+
+This usually means the plugin cache has stale code. Clear the cache as described above.
+
 ## Requirements
 
 - [Alma](https://github.com/yetone/alma)
