@@ -4708,11 +4708,27 @@ function handleChatCompletion(body, accessToken, res, logger) {
     handleStreaming(payload, accessToken, modelId, sessionKey, res);
   }
 }
+function extractContent(content) {
+  if (typeof content === "string")
+    return content;
+  if (content == null)
+    return "";
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === "string")
+        return part;
+      if (typeof part === "object" && part !== null && typeof part.text === "string")
+        return part.text;
+      return "";
+    }).join("");
+  }
+  return String(content);
+}
 function parseMessages(messages) {
   let systemPrompt = "You are a helpful assistant.";
   const pairs = [];
   const toolResults = [];
-  const systemParts = messages.filter((m) => m.role === "system").map((m) => m.content ?? "");
+  const systemParts = messages.filter((m) => m.role === "system").map((m) => extractContent(m.content));
   if (systemParts.length > 0)
     systemPrompt = systemParts.join(`
 `);
@@ -4720,14 +4736,14 @@ function parseMessages(messages) {
   let pendingUser = "";
   for (const msg of nonSystem) {
     if (msg.role === "tool") {
-      toolResults.push({ toolCallId: msg.tool_call_id ?? "", content: msg.content ?? "" });
+      toolResults.push({ toolCallId: msg.tool_call_id ?? "", content: extractContent(msg.content) });
     } else if (msg.role === "user") {
       if (pendingUser)
         pairs.push({ userText: pendingUser, assistantText: "" });
-      pendingUser = msg.content ?? "";
+      pendingUser = extractContent(msg.content);
     } else if (msg.role === "assistant") {
       if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: msg.content ?? "" });
+        pairs.push({ userText: pendingUser, assistantText: extractContent(msg.content) });
         pendingUser = "";
       }
     }

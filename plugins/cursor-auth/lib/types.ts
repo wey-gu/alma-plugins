@@ -48,7 +48,8 @@ export interface OpenAIToolCall {
 
 export interface OpenAIMessage {
     role: 'system' | 'user' | 'assistant' | 'tool';
-    content: string | null;
+    /** Content can be a string OR an array of content parts (e.g. [{type:"text", text:"..."}]) */
+    content: string | Array<{ type: string; text?: string; [key: string]: unknown }> | null;
     tool_call_id?: string;
     tool_calls?: OpenAIToolCall[];
 }

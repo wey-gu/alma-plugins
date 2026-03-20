@@ -272,12 +272,33 @@ function handleChatCompletion(
 // Message Parsing
 // ============================================================================
 
+/**
+ * Extract text from message content.
+ * AI SDK may send content as a string OR as an array of content parts:
+ *   "hello"  OR  [{type: "text", text: "hello"}, ...]
+ * Without this normalization, arrays become "[object Object]".
+ */
+function extractContent(content: unknown): string {
+    if (typeof content === 'string') return content;
+    if (content == null) return '';
+    if (Array.isArray(content)) {
+        return content
+            .map((part: any) => {
+                if (typeof part === 'string') return part;
+                if (typeof part === 'object' && part !== null && typeof part.text === 'string') return part.text;
+                return '';
+            })
+            .join('');
+    }
+    return String(content);
+}
+
 function parseMessages(messages: OpenAIMessage[]): { systemPrompt: string; userText: string; turns: Array<{ userText: string; assistantText: string }>; toolResults: ToolResultInfo[] } {
     let systemPrompt = 'You are a helpful assistant.';
     const pairs: Array<{ userText: string; assistantText: string }> = [];
     const toolResults: ToolResultInfo[] = [];
 
-    const systemParts = messages.filter((m) => m.role === 'system').map((m) => m.content ?? '');
+    const systemParts = messages.filter((m) => m.role === 'system').map((m) => extractContent(m.content));
     if (systemParts.length > 0) systemPrompt = systemParts.join('\n');
 
     const nonSystem = messages.filter((m) => m.role !== 'system');
@@ -285,12 +306,12 @@ function parseMessages(messages: OpenAIMessage[]): { systemPrompt: string; userT
 
     for (const msg of nonSystem) {
         if (msg.role === 'tool') {
-            toolResults.push({ toolCallId: msg.tool_call_id ?? '', content: msg.content ?? '' });
+            toolResults.push({ toolCallId: msg.tool_call_id ?? '', content: extractContent(msg.content) });
         } else if (msg.role === 'user') {
             if (pendingUser) pairs.push({ userText: pendingUser, assistantText: '' });
-            pendingUser = msg.content ?? '';
+            pendingUser = extractContent(msg.content);
         } else if (msg.role === 'assistant') {
-            if (pendingUser) { pairs.push({ userText: pendingUser, assistantText: msg.content ?? '' }); pendingUser = ''; }
+            if (pendingUser) { pairs.push({ userText: pendingUser, assistantText: extractContent(msg.content) }); pendingUser = ''; }
         }
     }
 
