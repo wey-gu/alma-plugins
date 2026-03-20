@@ -4605,7 +4605,7 @@ function startProxy(getAccessToken, logger) {
           const bodyStr = await readBody(req);
           const body = JSON.parse(bodyStr);
           const accessToken = await getAccessToken();
-          logger.debug(`Cursor proxy: model=${body.model}, stream=${body.stream}, messages=${body.messages.length}`);
+          logger.debug(`Cursor proxy: model=${body.model}, stream=${body.stream}, messages=${body.messages?.length}`);
           handleChatCompletion(body, accessToken, res, logger);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);

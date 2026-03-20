@@ -139,7 +139,7 @@ export function startProxy(getAccessToken: () => Promise<string>, logger: Logger
                     const body = JSON.parse(bodyStr) as ChatCompletionRequest;
                     const accessToken = await getAccessToken();
 
-                    logger.debug(`Cursor proxy: model=${body.model}, stream=${body.stream}, messages=${body.messages.length}`);
+                    logger.debug(`Cursor proxy: model=${body.model}, stream=${body.stream}, messages=${body.messages?.length}`);
 
                     handleChatCompletion(body, accessToken, res, logger);
                 } catch (err) {
