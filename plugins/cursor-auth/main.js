@@ -5151,6 +5151,7 @@ async function activate(context) {
     name: "Cursor",
     description: "Access Claude, GPT, Gemini and other models via your Cursor subscription",
     authType: "oauth",
+    sdkType: "openai-compatible",
     async initialize() {
       logger.info("Cursor provider initialized");
     },
