@@ -4453,6 +4453,7 @@ function fetchViaHttp2(body, apiKey) {
   return new Promise((resolve) => {
     const client = http2.connect(CURSOR_BASE_URL);
     const chunks = [];
+    let statusOk = false;
     const timeout = setTimeout(() => {
       client.destroy();
       resolve(null);
@@ -4471,12 +4472,20 @@ function fetchViaHttp2(body, apiKey) {
       "x-cursor-client-version": CURSOR_CLIENT_VERSION,
       "x-cursor-client-type": "cli"
     });
+    stream.on("response", (headers) => {
+      const status = headers[":status"];
+      statusOk = typeof status === "number" && status >= 200 && status < 300;
+    });
     stream.on("data", (chunk) => {
       chunks.push(chunk);
     });
     stream.on("end", () => {
       clearTimeout(timeout);
       client.close();
+      if (!statusOk) {
+        resolve(null);
+        return;
+      }
       const result = Buffer.concat(chunks);
       resolve(new Uint8Array(result));
     });
@@ -4599,7 +4608,7 @@ function createCursorFetch(getAccessToken, logger) {
       const body = JSON.parse(bodyStr);
       const accessToken = await getAccessToken();
       logger.debug(`Cursor request: model=${body.model}, stream=${body.stream}, messages=${body.messages.length}`);
-      return handleChatCompletion(body, accessToken, logger);
+      return await handleChatCompletion(body, accessToken, logger);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error("Cursor fetch error:", message);
@@ -4621,7 +4630,7 @@ function disposeAllSessions() {
     activeSessions.delete(key);
   }
 }
-function handleChatCompletion(body, accessToken, logger) {
+async function handleChatCompletion(body, accessToken, logger) {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = body.tools ?? [];
@@ -4650,7 +4659,7 @@ function handleChatCompletion(body, accessToken, logger) {
   const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
   payload.mcpTools = mcpTools;
   if (body.stream === false) {
-    return handleNonStreaming(payload, accessToken, modelId, logger);
+    return await handleNonStreaming(payload, accessToken, modelId, logger);
   }
   return handleStreaming(payload, accessToken, modelId, sessionKey, logger);
 }
@@ -5040,9 +5049,20 @@ function resumeWithToolResults(session, toolResults, modelId, tools, accessToken
     headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" }
   });
 }
-function handleNonStreaming(payload, accessToken, modelId, logger) {
+async function handleNonStreaming(payload, accessToken, modelId, logger) {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
+  const fullText = await collectFullResponse(payload, accessToken);
+  return new Response(JSON.stringify({
+    id: completionId,
+    object: "chat.completion",
+    created,
+    model: modelId,
+    choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+  }), { headers: { "Content-Type": "application/json" } });
+}
+function collectFullResponse(payload, accessToken) {
   const { promise, resolve } = Promise.withResolvers();
   const { client: h2Client, stream: h2Stream } = createH2Stream(accessToken);
   h2Stream.write(frameConnectMessage(payload.requestBytes));
@@ -5087,15 +5107,7 @@ function handleNonStreaming(payload, accessToken, modelId, logger) {
     } catch {}
     resolve(fullText);
   });
-  const responsePromise = promise.then((text) => new Response(JSON.stringify({
-    id: completionId,
-    object: "chat.completion",
-    created,
-    model: modelId,
-    choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-  }), { headers: { "Content-Type": "application/json" } }));
-  return responsePromise;
+  return promise;
 }
 
 // main.ts

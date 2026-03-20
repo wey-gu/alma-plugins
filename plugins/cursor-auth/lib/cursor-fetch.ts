@@ -149,7 +149,7 @@ export function createCursorFetch(
 
             logger.debug(`Cursor request: model=${body.model}, stream=${body.stream}, messages=${body.messages.length}`);
 
-            return handleChatCompletion(body, accessToken, logger);
+            return await handleChatCompletion(body, accessToken, logger);
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             logger.error('Cursor fetch error:', message);
@@ -177,11 +177,11 @@ export function disposeAllSessions(): void {
 // Chat Completion Handler
 // ============================================================================
 
-function handleChatCompletion(
+async function handleChatCompletion(
     body: ChatCompletionRequest,
     accessToken: string,
     logger: Logger,
-): Response {
+): Promise<Response> {
     const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
     const modelId = body.model;
     const tools = body.tools ?? [];
@@ -217,7 +217,7 @@ function handleChatCompletion(
     payload.mcpTools = mcpTools;
 
     if (body.stream === false) {
-        return handleNonStreaming(payload, accessToken, modelId, logger);
+        return await handleNonStreaming(payload, accessToken, modelId, logger);
     }
     return handleStreaming(payload, accessToken, modelId, sessionKey, logger);
 }
@@ -700,16 +700,28 @@ function resumeWithToolResults(
 // Non-Streaming Response
 // ============================================================================
 
-function handleNonStreaming(
+async function handleNonStreaming(
     payload: CursorRequestPayload,
     accessToken: string,
     modelId: string,
     logger: Logger,
-): Response {
+): Promise<Response> {
     const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, '').slice(0, 28)}`;
     const created = Math.floor(Date.now() / 1000);
 
-    // Return a Response whose body is resolved asynchronously
+    const fullText = await collectFullResponse(payload, accessToken);
+
+    return new Response(JSON.stringify({
+        id: completionId, object: 'chat.completion', created, model: modelId,
+        choices: [{ index: 0, message: { role: 'assistant', content: fullText }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    }), { headers: { 'Content-Type': 'application/json' } });
+}
+
+function collectFullResponse(
+    payload: CursorRequestPayload,
+    accessToken: string,
+): Promise<string> {
     const { promise, resolve } = Promise.withResolvers<string>();
 
     const { client: h2Client, stream: h2Stream } = createH2Stream(accessToken);
@@ -744,14 +756,5 @@ function handleNonStreaming(
     h2Stream.on('end', () => { clearInterval(heartbeatTimer); h2Client.close(); resolve(fullText); });
     h2Stream.on('error', () => { clearInterval(heartbeatTimer); try { h2Client.close(); } catch {} resolve(fullText); });
 
-    // Return response backed by the promise
-    const responsePromise = promise.then((text) =>
-        new Response(JSON.stringify({
-            id: completionId, object: 'chat.completion', created, model: modelId,
-            choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        }), { headers: { 'Content-Type': 'application/json' } }),
-    );
-
-    return responsePromise as unknown as Response;
+    return promise;
 }

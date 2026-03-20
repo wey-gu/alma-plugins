@@ -68,6 +68,7 @@ function fetchViaHttp2(body: Uint8Array, apiKey: string): Promise<Uint8Array | n
     return new Promise((resolve) => {
         const client = http2.connect(CURSOR_BASE_URL);
         const chunks: Buffer[] = [];
+        let statusOk = false;
 
         const timeout = setTimeout(() => {
             client.destroy();
@@ -90,6 +91,12 @@ function fetchViaHttp2(body: Uint8Array, apiKey: string): Promise<Uint8Array | n
             'x-cursor-client-type': 'cli',
         });
 
+        // Check HTTP/2 response status (matching opencode-cursor's curl status check)
+        stream.on('response', (headers) => {
+            const status = headers[':status'];
+            statusOk = typeof status === 'number' && status >= 200 && status < 300;
+        });
+
         stream.on('data', (chunk: Buffer) => {
             chunks.push(chunk);
         });
@@ -97,6 +104,7 @@ function fetchViaHttp2(body: Uint8Array, apiKey: string): Promise<Uint8Array | n
         stream.on('end', () => {
             clearTimeout(timeout);
             client.close();
+            if (!statusOk) { resolve(null); return; }
             const result = Buffer.concat(chunks);
             resolve(new Uint8Array(result));
         });
