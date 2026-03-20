@@ -1,0 +1,14 @@
+{
+    "name": "@alma/cursor-auth",
+    "version": "1.0.0",
+    "type": "module",
+    "description": "Cursor OAuth plugin for Alma with local OpenAI-compatible proxy",
+    "author": {
+        "name": "Alma Community"
+    },
+    "license": "MIT",
+    "main": "main.ts",
+    "dependencies": {
+        "@bufbuild/protobuf": "^2.0.0"
+    }
+}
