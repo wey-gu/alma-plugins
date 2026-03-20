@@ -5217,9 +5217,25 @@ async function activate(context) {
         contextWindow: model.contextWindow,
         maxOutputTokens: model.maxTokens,
         capabilities: {
+          temperature: true,
           streaming: true,
           reasoning: model.reasoning,
-          functionCalling: true
+          attachment: false,
+          functionCalling: true,
+          input: {
+            text: true,
+            audio: false,
+            image: false,
+            video: false,
+            pdf: false
+          },
+          output: {
+            text: true,
+            audio: false,
+            image: false,
+            video: false,
+            pdf: false
+          }
         }
       }));
     },
@@ -5236,9 +5252,25 @@ async function activate(context) {
           contextWindow: model.contextWindow,
           maxOutputTokens: model.maxTokens,
           capabilities: {
+            temperature: true,
             streaming: true,
             reasoning: model.reasoning,
-            functionCalling: true
+            attachment: false,
+            functionCalling: true,
+            input: {
+              text: true,
+              audio: false,
+              image: false,
+              video: false,
+              pdf: false
+            },
+            output: {
+              text: true,
+              audio: false,
+              image: false,
+              video: false,
+              pdf: false
+            }
           }
         }));
       } catch (error) {

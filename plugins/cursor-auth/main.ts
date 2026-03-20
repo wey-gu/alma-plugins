@@ -118,9 +118,25 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 contextWindow: model.contextWindow,
                 maxOutputTokens: model.maxTokens,
                 capabilities: {
+                    temperature: true,
                     streaming: true,
                     reasoning: model.reasoning,
+                    attachment: false,
                     functionCalling: true,
+                    input: {
+                        text: true,
+                        audio: false,
+                        image: false,
+                        video: false,
+                        pdf: false,
+                    },
+                    output: {
+                        text: true,
+                        audio: false,
+                        image: false,
+                        video: false,
+                        pdf: false,
+                    },
                 },
             }));
         },
@@ -139,9 +155,25 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     contextWindow: model.contextWindow,
                     maxOutputTokens: model.maxTokens,
                     capabilities: {
+                        temperature: true,
                         streaming: true,
                         reasoning: model.reasoning,
+                        attachment: false,
                         functionCalling: true,
+                        input: {
+                            text: true,
+                            audio: false,
+                            image: false,
+                            video: false,
+                            pdf: false,
+                        },
+                        output: {
+                            text: true,
+                            audio: false,
+                            image: false,
+                            video: false,
+                            pdf: false,
+                        },
                     },
                 }));
             } catch (error) {
