@@ -4,20 +4,20 @@ Use your Cursor subscription to access Claude, GPT, Gemini, and other models ins
 
 ## How it works
 
-1. **OAuth** — Browser-based login to Cursor via PKCE (poll-based, no callback needed).
+This follows the same architecture as openai-codex-auth:
+
+1. **OAuth** — Browser-based login to Cursor via PKCE (poll-based).
 2. **Model discovery** — Queries Cursor's gRPC API for all available models.
-3. **Local proxy** — Translates `POST /v1/chat/completions` (OpenAI format) into Cursor's protobuf/HTTP2 Connect protocol.
+3. **Custom fetch** — `getSDKConfig()` returns a custom fetch wrapper that intercepts AI SDK requests and translates OpenAI chat/completions format into Cursor's protobuf/HTTP2 Connect protocol.
 4. **Native tool routing** — Rejects Cursor's built-in filesystem/shell tools and exposes Alma's tool surface via Cursor MCP instead.
 
 ## Architecture
 
 ```
-Alma  -->  AI SDK  -->  /v1/chat/completions  -->  Local HTTP proxy
-                                                        |
-                                                   Node.js http2
-                                                        |
-                                                   api2.cursor.sh
-                                                 /agent.v1.AgentService/Run
+Alma  -->  AI SDK  -->  custom fetch  -->  HTTP/2 Connect stream
+                                                  |
+                                           api2.cursor.sh
+                                         /agent.v1.AgentService/Run
 ```
 
 ### Tool call flow
@@ -25,11 +25,11 @@ Alma  -->  AI SDK  -->  /v1/chat/completions  -->  Local HTTP proxy
 ```
 1. Cursor model receives Alma tools via RequestContext (as MCP tool defs)
 2. Model tries native tools (readArgs, shellArgs, etc.)
-3. Proxy rejects each with typed error (ReadRejected, ShellRejected, etc.)
+3. Custom fetch rejects each with typed error (ReadRejected, ShellRejected, etc.)
 4. Model falls back to MCP tool -> mcpArgs exec message
-5. Proxy emits OpenAI tool_calls SSE chunk
+5. Custom fetch emits OpenAI tool_calls SSE chunk
 6. Alma executes tool, sends result in follow-up request
-7. Proxy resumes HTTP/2 stream with mcpResult, streams continuation
+7. Custom fetch resumes HTTP/2 stream with mcpResult, streams continuation
 ```
 
 ## Install
@@ -38,15 +38,13 @@ Copy `main.js` and `manifest.json` into `~/.config/alma/plugins/cursor-auth/`. T
 
 ## Build from source
 
-If you need to rebuild `main.js` from the TypeScript sources:
-
 ```sh
 cd plugins/cursor-auth
 bun install
 bun run build
 ```
 
-This bundles `main.ts` + all `lib/` modules + `proto/agent_pb.ts` + `@bufbuild/protobuf` into a single `main.js`.
+This bundles all modules (TypeScript source + protobuf schema + `@bufbuild/protobuf` runtime) into a single `main.js`.
 
 ## Authenticate
 
@@ -61,7 +59,7 @@ Tokens are refreshed automatically before expiration.
 
 ## Models
 
-Models are discovered dynamically from Cursor's API. If discovery fails, the plugin falls back to a hardcoded list:
+Models are discovered dynamically from Cursor's API. Fallback list:
 
 | Model | Reasoning | Context |
 |-------|-----------|---------|
@@ -72,19 +70,7 @@ Models are discovered dynamically from Cursor's API. If discovery fails, the plu
 | cursor-small | No | 200K |
 | gemini-2.5-pro | Yes | 1M |
 
-## Key differences from opencode-cursor
-
-| Feature | opencode-cursor | cursor-auth (Alma) |
-|---------|----------------|-------------------|
-| Runtime | Bun | Node.js (Electron) |
-| HTTP/2 | Child process bridge | Direct `node:http2` |
-| Proxy server | `Bun.serve()` | `http.createServer()` |
-| Auth flow | Plugin hooks | `providers.register()` |
-| Token storage | OpenCode auth API | Alma secret storage |
-| Plugin format | npm package | Alma plugin manifest |
-
 ## Requirements
 
 - [Alma](https://github.com/your-org/alma)
 - Active [Cursor](https://cursor.com) subscription
-- Node.js >= 18 (included with Electron)

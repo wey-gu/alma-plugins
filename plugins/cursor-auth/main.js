@@ -1,16 +1,5 @@
-// main.ts
-import { exec } from "node:child_process";
-
-// lib/pkce.ts
-async function generatePKCE() {
-  const verifierBytes = new Uint8Array(96);
-  crypto.getRandomValues(verifierBytes);
-  const verifier = Buffer.from(verifierBytes).toString("base64url");
-  const data = new TextEncoder().encode(verifier);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const challenge = Buffer.from(hashBuffer).toString("base64url");
-  return { verifier, challenge };
-}
+import { createRequire } from "node:module";
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // lib/auth.ts
 var CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
@@ -20,6 +9,15 @@ var POLL_MAX_ATTEMPTS = 150;
 var POLL_BASE_DELAY = 1000;
 var POLL_MAX_DELAY = 1e4;
 var POLL_BACKOFF_MULTIPLIER = 1.2;
+async function generatePKCE() {
+  const verifierBytes = new Uint8Array(96);
+  crypto.getRandomValues(verifierBytes);
+  const verifier = Buffer.from(verifierBytes).toString("base64url");
+  const data = new TextEncoder().encode(verifier);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const challenge = Buffer.from(hashBuffer).toString("base64url");
+  return { verifier, challenge };
+}
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -4573,164 +4571,105 @@ function pickDisplayName(model, fallbackId) {
   return fallbackId;
 }
 
-// lib/proxy.ts
-import * as http from "node:http";
+// lib/cursor-fetch.ts
 import * as http22 from "node:http2";
 import { createHash } from "node:crypto";
 var CURSOR_API_URL = "https://api2.cursor.sh";
 var CURSOR_CLIENT_VERSION2 = "cli-2026.02.13-41ac335";
 var CONNECT_END_STREAM_FLAG = 2;
-var activeBridges = new Map;
-var proxyServer;
-var proxyPort;
-function startProxy(getAccessToken) {
-  if (proxyServer && proxyPort)
-    return Promise.resolve(proxyPort);
-  return new Promise((resolve, reject) => {
-    const server = http.createServer(async (req, res) => {
-      if (req.method === "GET" && req.url === "/v1/models") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ object: "list", data: [] }));
-        return;
+var activeSessions = new Map;
+function createCursorFetch(getAccessToken, logger) {
+  return async (input, init) => {
+    let url;
+    if (typeof input === "string") {
+      url = input;
+    } else if (input instanceof URL) {
+      url = input.toString();
+    } else {
+      url = input.url;
+    }
+    if (!url.includes("/chat/completions")) {
+      if (url.includes("/models")) {
+        return new Response(JSON.stringify({ object: "list", data: [] }), { headers: { "Content-Type": "application/json" } });
       }
-      if (req.method === "POST" && req.url === "/v1/chat/completions") {
-        try {
-          const bodyStr = await readRequestBody(req);
-          const body = JSON.parse(bodyStr);
-          const accessToken = await getAccessToken();
-          await handleChatCompletion(body, accessToken, res);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            error: { message, type: "server_error", code: "internal_error" }
-          }));
-        }
-        return;
-      }
-      res.writeHead(404);
-      res.end("Not Found");
-    });
-    server.listen(0, () => {
-      const addr = server.address();
-      if (typeof addr === "object" && addr) {
-        proxyPort = addr.port;
-        proxyServer = server;
-        resolve(addr.port);
-      } else {
-        reject(new Error("Failed to bind proxy to a port"));
-      }
-    });
-    server.on("error", reject);
-  });
-}
-function stopProxy() {
-  if (proxyServer) {
-    proxyServer.close();
-    proxyServer = undefined;
-    proxyPort = undefined;
-  }
-  for (const [key, active] of activeBridges) {
-    clearInterval(active.heartbeatTimer);
+      return globalThis.fetch(input, init);
+    }
     try {
-      active.h2Stream.close();
+      const bodyStr = typeof init?.body === "string" ? init.body : "";
+      const body = JSON.parse(bodyStr);
+      const accessToken = await getAccessToken();
+      logger.debug(`Cursor request: model=${body.model}, stream=${body.stream}, messages=${body.messages.length}`);
+      return handleChatCompletion(body, accessToken, logger);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("Cursor fetch error:", message);
+      return new Response(JSON.stringify({
+        error: { message, type: "server_error", code: "internal_error" }
+      }), { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+  };
+}
+function disposeAllSessions() {
+  for (const [key, session] of activeSessions) {
+    clearInterval(session.heartbeatTimer);
+    try {
+      session.h2Stream.close();
     } catch {}
     try {
-      active.h2Client.close();
+      session.h2Client.close();
     } catch {}
-    activeBridges.delete(key);
+    activeSessions.delete(key);
   }
 }
-function readRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-    req.on("error", reject);
-  });
-}
-function frameConnectMessage(data, flags = 0) {
-  const frame = Buffer.alloc(5 + data.length);
-  frame[0] = flags;
-  frame.writeUInt32BE(data.length, 1);
-  frame.set(data, 5);
-  return frame;
-}
-function createH2Stream(accessToken) {
-  const client = http22.connect(CURSOR_API_URL);
-  client.on("error", () => {});
-  const stream = client.request({
-    ":method": "POST",
-    ":path": "/agent.v1.AgentService/Run",
-    "content-type": "application/connect+proto",
-    "connect-protocol-version": "1",
-    te: "trailers",
-    authorization: `Bearer ${accessToken}`,
-    "x-ghost-mode": "true",
-    "x-cursor-client-version": CURSOR_CLIENT_VERSION2,
-    "x-cursor-client-type": "cli",
-    "x-request-id": crypto.randomUUID()
-  });
-  return { client, stream };
-}
-async function handleChatCompletion(body, accessToken, res) {
+function handleChatCompletion(body, accessToken, logger) {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = body.tools ?? [];
   if (!userText && toolResults.length === 0) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
+    return new Response(JSON.stringify({
       error: { message: "No user message found", type: "invalid_request_error" }
-    }));
-    return;
+    }), { status: 400, headers: { "Content-Type": "application/json" } });
   }
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
-  const activeBridge = activeBridges.get(bridgeKey);
-  if (activeBridge && toolResults.length > 0) {
-    activeBridges.delete(bridgeKey);
-    handleToolResultResume(activeBridge, toolResults, modelId, tools, accessToken, bridgeKey, res);
-    return;
+  const sessionKey = deriveSessionKey(modelId, body.messages);
+  const activeSession = activeSessions.get(sessionKey);
+  if (activeSession && toolResults.length > 0) {
+    activeSessions.delete(sessionKey);
+    return resumeWithToolResults(activeSession, toolResults, modelId, tools, accessToken, sessionKey, logger);
   }
-  if (activeBridge) {
-    clearInterval(activeBridge.heartbeatTimer);
+  if (activeSession) {
+    clearInterval(activeSession.heartbeatTimer);
     try {
-      activeBridge.h2Stream.close();
+      activeSession.h2Stream.close();
     } catch {}
     try {
-      activeBridge.h2Client.close();
+      activeSession.h2Client.close();
     } catch {}
-    activeBridges.delete(bridgeKey);
+    activeSessions.delete(sessionKey);
   }
   const mcpTools = buildMcpToolDefinitions(tools);
   const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
   payload.mcpTools = mcpTools;
   if (body.stream === false) {
-    await handleNonStreamingResponse(payload, accessToken, modelId, res);
-  } else {
-    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, res);
+    return handleNonStreaming(payload, accessToken, modelId, logger);
   }
+  return handleStreaming(payload, accessToken, modelId, sessionKey, logger);
 }
 function parseMessages(messages) {
   let systemPrompt = "You are a helpful assistant.";
   const pairs = [];
   const toolResults = [];
   const systemParts = messages.filter((m) => m.role === "system").map((m) => m.content ?? "");
-  if (systemParts.length > 0) {
+  if (systemParts.length > 0)
     systemPrompt = systemParts.join(`
 `);
-  }
   const nonSystem = messages.filter((m) => m.role !== "system");
   let pendingUser = "";
   for (const msg of nonSystem) {
     if (msg.role === "tool") {
-      toolResults.push({
-        toolCallId: msg.tool_call_id ?? "",
-        content: msg.content ?? ""
-      });
+      toolResults.push({ toolCallId: msg.tool_call_id ?? "", content: msg.content ?? "" });
     } else if (msg.role === "user") {
-      if (pendingUser) {
+      if (pendingUser)
         pairs.push({ userText: pendingUser, assistantText: "" });
-      }
       pendingUser = msg.content ?? "";
     } else if (msg.role === "assistant") {
       const text = msg.content ?? "";
@@ -4781,25 +4720,16 @@ function buildCursorRequest(modelId, systemPrompt, userText, turns) {
   const blobStore = new Map;
   const turnBytes = [];
   for (const turn of turns) {
-    const userMsg = create(UserMessageSchema, {
-      text: turn.userText,
-      messageId: crypto.randomUUID()
-    });
+    const userMsg = create(UserMessageSchema, { text: turn.userText, messageId: crypto.randomUUID() });
     const userMsgBytes = toBinary(UserMessageSchema, userMsg);
     const stepBytes = [];
     if (turn.assistantText) {
       const step = create(ConversationStepSchema, {
-        message: {
-          case: "assistantMessage",
-          value: create(AssistantMessageSchema, { text: turn.assistantText })
-        }
+        message: { case: "assistantMessage", value: create(AssistantMessageSchema, { text: turn.assistantText }) }
       });
       stepBytes.push(toBinary(ConversationStepSchema, step));
     }
-    const agentTurn = create(AgentConversationTurnStructureSchema, {
-      userMessage: userMsgBytes,
-      steps: stepBytes
-    });
+    const agentTurn = create(AgentConversationTurnStructureSchema, { userMessage: userMsgBytes, steps: stepBytes });
     const turnStructure = create(ConversationTurnStructureSchema, {
       turn: { case: "agentConversationTurn", value: agentTurn }
     });
@@ -4823,35 +4753,21 @@ function buildCursorRequest(modelId, systemPrompt, userText, turns) {
     selfSummaryCount: 0,
     readPaths: []
   });
-  const userMessage = create(UserMessageSchema, {
-    text: userText,
-    messageId: crypto.randomUUID()
-  });
+  const userMessage = create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() });
   const action = create(ConversationActionSchema, {
-    action: {
-      case: "userMessageAction",
-      value: create(UserMessageActionSchema, { userMessage })
-    }
+    action: { case: "userMessageAction", value: create(UserMessageActionSchema, { userMessage }) }
   });
-  const modelDetails = create(ModelDetailsSchema, {
-    modelId,
-    displayModelId: modelId,
-    displayName: modelId
-  });
-  const runRequest = create(AgentRunRequestSchema, {
-    conversationState,
-    action,
-    modelDetails,
-    conversationId: crypto.randomUUID()
-  });
-  const clientMessage = create(AgentClientMessageSchema, {
-    message: { case: "runRequest", value: runRequest }
-  });
-  return {
-    requestBytes: toBinary(AgentClientMessageSchema, clientMessage),
-    blobStore,
-    mcpTools: []
-  };
+  const modelDetails = create(ModelDetailsSchema, { modelId, displayModelId: modelId, displayName: modelId });
+  const runRequest = create(AgentRunRequestSchema, { conversationState, action, modelDetails, conversationId: crypto.randomUUID() });
+  const clientMessage = create(AgentClientMessageSchema, { message: { case: "runRequest", value: runRequest } });
+  return { requestBytes: toBinary(AgentClientMessageSchema, clientMessage), blobStore, mcpTools: [] };
+}
+function frameConnectMessage(data, flags = 0) {
+  const frame = Buffer.alloc(5 + data.length);
+  frame[0] = flags;
+  frame.writeUInt32BE(data.length, 1);
+  frame.set(data, 5);
+  return frame;
 }
 function parseConnectEndStream(data) {
   try {
@@ -4869,451 +4785,274 @@ function parseConnectEndStream(data) {
 }
 function makeHeartbeatBytes() {
   const heartbeat = create(AgentClientMessageSchema, {
-    message: {
-      case: "clientHeartbeat",
-      value: create(ClientHeartbeatSchema, {})
-    }
+    message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) }
   });
   return frameConnectMessage(toBinary(AgentClientMessageSchema, heartbeat));
+}
+function createH2Stream(accessToken) {
+  const client = http22.connect(CURSOR_API_URL);
+  client.on("error", () => {});
+  const stream = client.request({
+    ":method": "POST",
+    ":path": "/agent.v1.AgentService/Run",
+    "content-type": "application/connect+proto",
+    "connect-protocol-version": "1",
+    te: "trailers",
+    authorization: `Bearer ${accessToken}`,
+    "x-ghost-mode": "true",
+    "x-cursor-client-version": CURSOR_CLIENT_VERSION2,
+    "x-cursor-client-type": "cli",
+    "x-request-id": crypto.randomUUID()
+  });
+  return { client, stream };
 }
 function processServerMessage(msg, blobStore, mcpTools, sendFrame, state, onText, onMcpExec) {
   const msgCase = msg.message.case;
   if (msgCase === "interactionUpdate") {
-    handleInteractionUpdate(msg.message.value, onText);
+    const update = msg.message.value;
+    const updateCase = update.message?.case;
+    if (updateCase === "textDelta") {
+      const delta = update.message.value.text || "";
+      if (delta)
+        onText(delta, false);
+    } else if (updateCase === "thinkingDelta") {
+      const delta = update.message.value.text || "";
+      if (delta)
+        onText(delta, true);
+    }
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value, blobStore, sendFrame);
   } else if (msgCase === "execServerMessage") {
     handleExecMessage(msg.message.value, mcpTools, sendFrame, onMcpExec);
   }
 }
-function handleInteractionUpdate(update, onText) {
-  const updateCase = update.message?.case;
-  if (updateCase === "textDelta") {
-    const delta = update.message.value.text || "";
-    if (delta)
-      onText(delta, false);
-  } else if (updateCase === "thinkingDelta") {
-    const delta = update.message.value.text || "";
-    if (delta)
-      onText(delta, true);
-  }
-}
 function handleKvMessage(kvMsg, blobStore, sendFrame) {
   const kvCase = kvMsg.message.case;
   if (kvCase === "getBlobArgs") {
     const blobId = kvMsg.message.value.blobId;
-    const blobIdKey = Buffer.from(blobId).toString("hex");
-    const blobData = blobStore.get(blobIdKey);
+    const blobData = blobStore.get(Buffer.from(blobId).toString("hex"));
     const response = create(KvClientMessageSchema, {
       id: kvMsg.id,
-      message: {
-        case: "getBlobResult",
-        value: create(GetBlobResultSchema, blobData ? { blobData } : {})
-      }
+      message: { case: "getBlobResult", value: create(GetBlobResultSchema, blobData ? { blobData } : {}) }
     });
-    const clientMsg = create(AgentClientMessageSchema, {
-      message: { case: "kvClientMessage", value: response }
-    });
+    const clientMsg = create(AgentClientMessageSchema, { message: { case: "kvClientMessage", value: response } });
     sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)));
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = kvMsg.message.value;
     blobStore.set(Buffer.from(blobId).toString("hex"), blobData);
     const response = create(KvClientMessageSchema, {
       id: kvMsg.id,
-      message: {
-        case: "setBlobResult",
-        value: create(SetBlobResultSchema, {})
-      }
+      message: { case: "setBlobResult", value: create(SetBlobResultSchema, {}) }
     });
-    const clientMsg = create(AgentClientMessageSchema, {
-      message: { case: "kvClientMessage", value: response }
-    });
+    const clientMsg = create(AgentClientMessageSchema, { message: { case: "kvClientMessage", value: response } });
     sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)));
   }
 }
 function handleExecMessage(execMsg, mcpTools, sendFrame, onMcpExec) {
   const execCase = execMsg.message.case;
+  const REJECT = "Tool not available in this environment. Use the MCP tools provided instead.";
   if (execCase === "requestContextArgs") {
-    const requestContext = create(RequestContextSchema, {
-      rules: [],
-      repositoryInfo: [],
-      tools: mcpTools,
-      gitRepos: [],
-      projectLayouts: [],
-      mcpInstructions: [],
-      fileContents: {},
-      customSubagents: []
-    });
-    const result = create(RequestContextResultSchema, {
-      result: {
-        case: "success",
-        value: create(RequestContextSuccessSchema, { requestContext })
-      }
-    });
+    const ctx = create(RequestContextSchema, { rules: [], repositoryInfo: [], tools: mcpTools, gitRepos: [], projectLayouts: [], mcpInstructions: [], fileContents: {}, customSubagents: [] });
+    const result = create(RequestContextResultSchema, { result: { case: "success", value: create(RequestContextSuccessSchema, { requestContext: ctx }) } });
     sendExecResult(execMsg, "requestContextResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "mcpArgs") {
+  } else if (execCase === "mcpArgs") {
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
-    onMcpExec({
-      execId: execMsg.execId,
-      execMsgId: execMsg.id,
-      toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
-      toolName: mcpArgs.toolName || mcpArgs.name,
-      decodedArgs: JSON.stringify(decoded)
-    });
-    return;
-  }
-  const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
-  if (execCase === "readArgs") {
+    onMcpExec({ execId: execMsg.execId, execMsgId: execMsg.id, toolCallId: mcpArgs.toolCallId || crypto.randomUUID(), toolName: mcpArgs.toolName || mcpArgs.name, decodedArgs: JSON.stringify(decoded) });
+  } else if (execCase === "readArgs") {
+    sendExecResult(execMsg, "readResult", create(ReadResultSchema, { result: { case: "rejected", value: create(ReadRejectedSchema, { path: execMsg.message.value.path, reason: REJECT }) } }), sendFrame);
+  } else if (execCase === "lsArgs") {
+    sendExecResult(execMsg, "lsResult", create(LsResultSchema, { result: { case: "rejected", value: create(LsRejectedSchema, { path: execMsg.message.value.path, reason: REJECT }) } }), sendFrame);
+  } else if (execCase === "grepArgs") {
+    sendExecResult(execMsg, "grepResult", create(GrepResultSchema, { result: { case: "error", value: create(GrepErrorSchema, { error: REJECT }) } }), sendFrame);
+  } else if (execCase === "writeArgs") {
+    sendExecResult(execMsg, "writeResult", create(WriteResultSchema, { result: { case: "rejected", value: create(WriteRejectedSchema, { path: execMsg.message.value.path, reason: REJECT }) } }), sendFrame);
+  } else if (execCase === "deleteArgs") {
+    sendExecResult(execMsg, "deleteResult", create(DeleteResultSchema, { result: { case: "rejected", value: create(DeleteRejectedSchema, { path: execMsg.message.value.path, reason: REJECT }) } }), sendFrame);
+  } else if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
     const args = execMsg.message.value;
-    const result = create(ReadResultSchema, {
-      result: { case: "rejected", value: create(ReadRejectedSchema, { path: args.path, reason: REJECT_REASON }) }
-    });
-    sendExecResult(execMsg, "readResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "lsArgs") {
+    sendExecResult(execMsg, "shellResult", create(ShellResultSchema, { result: { case: "rejected", value: create(ShellRejectedSchema, { command: args.command ?? "", workingDirectory: args.workingDirectory ?? "", reason: REJECT, isReadonly: false }) } }), sendFrame);
+  } else if (execCase === "backgroundShellSpawnArgs") {
     const args = execMsg.message.value;
-    const result = create(LsResultSchema, {
-      result: { case: "rejected", value: create(LsRejectedSchema, { path: args.path, reason: REJECT_REASON }) }
-    });
-    sendExecResult(execMsg, "lsResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "grepArgs") {
-    const result = create(GrepResultSchema, {
-      result: { case: "error", value: create(GrepErrorSchema, { error: REJECT_REASON }) }
-    });
-    sendExecResult(execMsg, "grepResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "writeArgs") {
-    const args = execMsg.message.value;
-    const result = create(WriteResultSchema, {
-      result: { case: "rejected", value: create(WriteRejectedSchema, { path: args.path, reason: REJECT_REASON }) }
-    });
-    sendExecResult(execMsg, "writeResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "deleteArgs") {
-    const args = execMsg.message.value;
-    const result = create(DeleteResultSchema, {
-      result: { case: "rejected", value: create(DeleteRejectedSchema, { path: args.path, reason: REJECT_REASON }) }
-    });
-    sendExecResult(execMsg, "deleteResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
-    const args = execMsg.message.value;
-    const result = create(ShellResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(ShellRejectedSchema, {
-          command: args.command ?? "",
-          workingDirectory: args.workingDirectory ?? "",
-          reason: REJECT_REASON,
-          isReadonly: false
-        })
-      }
-    });
-    sendExecResult(execMsg, "shellResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "backgroundShellSpawnArgs") {
-    const args = execMsg.message.value;
-    const result = create(BackgroundShellSpawnResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(ShellRejectedSchema, {
-          command: args.command ?? "",
-          workingDirectory: args.workingDirectory ?? "",
-          reason: REJECT_REASON,
-          isReadonly: false
-        })
-      }
-    });
-    sendExecResult(execMsg, "backgroundShellSpawnResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "writeShellStdinArgs") {
-    const result = create(WriteShellStdinResultSchema, {
-      result: { case: "error", value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }) }
-    });
-    sendExecResult(execMsg, "writeShellStdinResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "fetchArgs") {
-    const args = execMsg.message.value;
-    const result = create(FetchResultSchema, {
-      result: { case: "error", value: create(FetchErrorSchema, { url: args.url ?? "", error: REJECT_REASON }) }
-    });
-    sendExecResult(execMsg, "fetchResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "diagnosticsArgs") {
-    const result = create(DiagnosticsResultSchema, {});
-    sendExecResult(execMsg, "diagnosticsResult", result, sendFrame);
-    return;
-  }
-  const miscCaseMap = {
-    listMcpResourcesExecArgs: "listMcpResourcesExecResult",
-    readMcpResourceExecArgs: "readMcpResourceExecResult",
-    recordScreenArgs: "recordScreenResult",
-    computerUseArgs: "computerUseResult"
-  };
-  const resultCase = miscCaseMap[execCase];
-  if (resultCase) {
-    sendExecResult(execMsg, resultCase, create(McpResultSchema, {}), sendFrame);
-    return;
+    sendExecResult(execMsg, "backgroundShellSpawnResult", create(BackgroundShellSpawnResultSchema, { result: { case: "rejected", value: create(ShellRejectedSchema, { command: args.command ?? "", workingDirectory: args.workingDirectory ?? "", reason: REJECT, isReadonly: false }) } }), sendFrame);
+  } else if (execCase === "writeShellStdinArgs") {
+    sendExecResult(execMsg, "writeShellStdinResult", create(WriteShellStdinResultSchema, { result: { case: "error", value: create(WriteShellStdinErrorSchema, { error: REJECT }) } }), sendFrame);
+  } else if (execCase === "fetchArgs") {
+    sendExecResult(execMsg, "fetchResult", create(FetchResultSchema, { result: { case: "error", value: create(FetchErrorSchema, { url: execMsg.message.value.url ?? "", error: REJECT }) } }), sendFrame);
+  } else if (execCase === "diagnosticsArgs") {
+    sendExecResult(execMsg, "diagnosticsResult", create(DiagnosticsResultSchema, {}), sendFrame);
+  } else {
+    const miscMap = { listMcpResourcesExecArgs: "listMcpResourcesExecResult", readMcpResourceExecArgs: "readMcpResourceExecResult", recordScreenArgs: "recordScreenResult", computerUseArgs: "computerUseResult" };
+    const resultCase = miscMap[execCase];
+    if (resultCase)
+      sendExecResult(execMsg, resultCase, create(McpResultSchema, {}), sendFrame);
   }
 }
 function sendExecResult(execMsg, messageCase, value, sendFrame) {
-  const execClientMessage = create(ExecClientMessageSchema, {
-    id: execMsg.id,
-    execId: execMsg.execId,
-    message: { case: messageCase, value }
-  });
-  const clientMessage = create(AgentClientMessageSchema, {
-    message: { case: "execClientMessage", value: execClientMessage }
-  });
-  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  const execClient = create(ExecClientMessageSchema, { id: execMsg.id, execId: execMsg.execId, message: { case: messageCase, value } });
+  const clientMsg = create(AgentClientMessageSchema, { message: { case: "execClientMessage", value: execClient } });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)));
 }
-function deriveBridgeKey(modelId, messages) {
+function deriveSessionKey(modelId, messages) {
   const firstUser = messages.find((m) => m.role === "user")?.content ?? "";
   return createHash("sha256").update(`${modelId}:${firstUser.slice(0, 200)}`).digest("hex").slice(0, 16);
 }
-function handleStreamingResponse(payload, accessToken, modelId, bridgeKey, res) {
+function buildSSEStream(h2Client, h2Stream, heartbeatTimer, payload, modelId, sessionKey) {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive"
-  });
-  let closed = false;
-  const sendSSE = (data) => {
-    if (closed)
-      return;
-    res.write(`data: ${JSON.stringify(data)}
+  const encoder = new TextEncoder;
+  return new ReadableStream({
+    start(controller) {
+      let closed = false;
+      const send = (data) => {
+        if (!closed)
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}
 
-`);
-  };
-  const sendDone = () => {
-    if (closed)
-      return;
-    res.write(`data: [DONE]
+`));
+      };
+      const done = () => {
+        if (!closed)
+          controller.enqueue(encoder.encode(`data: [DONE]
 
-`);
-  };
-  const closeResponse = () => {
-    if (closed)
-      return;
-    closed = true;
-    res.end();
-  };
-  const makeChunk = (delta, finishReason = null) => ({
-    id: completionId,
-    object: "chat.completion.chunk",
-    created,
-    model: modelId,
-    choices: [{ index: 0, delta, finish_reason: finishReason }]
-  });
-  const state = {
-    thinkingActive: false,
-    toolCallIndex: 0,
-    pendingExecs: []
-  };
-  let mcpExecReceived = false;
-  const { client: h2Client, stream: h2Stream } = createH2Stream(accessToken);
-  h2Stream.write(frameConnectMessage(payload.requestBytes));
-  const heartbeatTimer = setInterval(() => {
-    if (!h2Stream.closed && !h2Stream.destroyed) {
-      h2Stream.write(makeHeartbeatBytes());
-    }
-  }, 5000);
-  let pendingBuffer = Buffer.alloc(0);
-  const processChunk = (incoming) => {
-    pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
-    while (pendingBuffer.length >= 5) {
-      const flags = pendingBuffer[0];
-      const msgLen = pendingBuffer.readUInt32BE(1);
-      if (pendingBuffer.length < 5 + msgLen)
-        break;
-      const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
-      pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-      if (flags & CONNECT_END_STREAM_FLAG) {
-        const endError = parseConnectEndStream(messageBytes);
-        if (endError) {
-          sendSSE(makeChunk({ content: `
+`));
+      };
+      const close = () => {
+        if (closed)
+          return;
+        closed = true;
+        controller.close();
+      };
+      const chunk = (delta, finish = null) => ({
+        id: completionId,
+        object: "chat.completion.chunk",
+        created,
+        model: modelId,
+        choices: [{ index: 0, delta, finish_reason: finish }]
+      });
+      const state = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
+      let mcpExecReceived = false;
+      let pendingBuffer = Buffer.alloc(0);
+      const processChunk = (incoming) => {
+        pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
+        while (pendingBuffer.length >= 5) {
+          const flags = pendingBuffer[0];
+          const msgLen = pendingBuffer.readUInt32BE(1);
+          if (pendingBuffer.length < 5 + msgLen)
+            break;
+          const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
+          pendingBuffer = pendingBuffer.subarray(5 + msgLen);
+          if (flags & CONNECT_END_STREAM_FLAG) {
+            const endError = parseConnectEndStream(messageBytes);
+            if (endError)
+              send(chunk({ content: `
 [Error: ${endError.message}]` }));
-        }
-        continue;
-      }
-      try {
-        const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
-        processServerMessage(serverMessage, payload.blobStore, payload.mcpTools, (data) => {
-          if (!h2Stream.closed && !h2Stream.destroyed) {
-            h2Stream.write(data);
+            continue;
           }
-        }, state, (text, isThinking) => {
-          if (isThinking) {
-            if (!state.thinkingActive) {
-              state.thinkingActive = true;
-              sendSSE(makeChunk({ role: "assistant", content: "<think>" }));
-            }
-            sendSSE(makeChunk({ content: text }));
-          } else {
-            if (state.thinkingActive) {
-              state.thinkingActive = false;
-              sendSSE(makeChunk({ content: "</think>" }));
-            }
-            sendSSE(makeChunk({ content: text }));
-          }
-        }, (exec) => {
-          state.pendingExecs.push(exec);
-          mcpExecReceived = true;
-          if (state.thinkingActive) {
-            sendSSE(makeChunk({ content: "</think>" }));
-            state.thinkingActive = false;
-          }
-          const toolCallIndex = state.toolCallIndex++;
-          sendSSE(makeChunk({
-            tool_calls: [{
-              index: toolCallIndex,
-              id: exec.toolCallId,
-              type: "function",
-              function: {
-                name: exec.toolName,
-                arguments: exec.decodedArgs
+          try {
+            const serverMsg = fromBinary(AgentServerMessageSchema, messageBytes);
+            processServerMessage(serverMsg, payload.blobStore, payload.mcpTools, (data) => {
+              if (!h2Stream.closed && !h2Stream.destroyed)
+                h2Stream.write(data);
+            }, state, (text, isThinking) => {
+              if (isThinking) {
+                if (!state.thinkingActive) {
+                  state.thinkingActive = true;
+                  send(chunk({ role: "assistant", content: "<think>" }));
+                }
+                send(chunk({ content: text }));
+              } else {
+                if (state.thinkingActive) {
+                  state.thinkingActive = false;
+                  send(chunk({ content: "</think>" }));
+                }
+                send(chunk({ content: text }));
               }
-            }]
-          }));
-          activeBridges.set(bridgeKey, {
-            h2Client,
-            h2Stream,
-            heartbeatTimer,
-            blobStore: payload.blobStore,
-            mcpTools: payload.mcpTools,
-            pendingExecs: state.pendingExecs
-          });
-          sendSSE(makeChunk({}, "tool_calls"));
-          sendDone();
-          closeResponse();
-        });
-      } catch {}
-    }
-  };
-  h2Stream.on("data", processChunk);
-  h2Stream.on("end", () => {
-    clearInterval(heartbeatTimer);
-    h2Client.close();
-    if (!mcpExecReceived) {
-      if (state.thinkingActive) {
-        sendSSE(makeChunk({ content: "</think>" }));
-      }
-      sendSSE(makeChunk({}, "stop"));
-      sendDone();
-      closeResponse();
-    }
-  });
-  h2Stream.on("error", () => {
-    clearInterval(heartbeatTimer);
-    try {
-      h2Client.close();
-    } catch {}
-    if (!mcpExecReceived) {
-      sendSSE(makeChunk({ content: `
-[Error: Connection lost]` }));
-      sendSSE(makeChunk({}, "stop"));
-      sendDone();
-      closeResponse();
+            }, (exec) => {
+              state.pendingExecs.push(exec);
+              mcpExecReceived = true;
+              if (state.thinkingActive) {
+                send(chunk({ content: "</think>" }));
+                state.thinkingActive = false;
+              }
+              send(chunk({ tool_calls: [{ index: state.toolCallIndex++, id: exec.toolCallId, type: "function", function: { name: exec.toolName, arguments: exec.decodedArgs } }] }));
+              activeSessions.set(sessionKey, { h2Client, h2Stream, heartbeatTimer, blobStore: payload.blobStore, mcpTools: payload.mcpTools, pendingExecs: state.pendingExecs });
+              send(chunk({}, "tool_calls"));
+              done();
+              close();
+            });
+          } catch {}
+        }
+      };
+      h2Stream.on("data", processChunk);
+      h2Stream.on("end", () => {
+        clearInterval(heartbeatTimer);
+        h2Client.close();
+        if (!mcpExecReceived) {
+          if (state.thinkingActive)
+            send(chunk({ content: "</think>" }));
+          send(chunk({}, "stop"));
+          done();
+          close();
+        }
+      });
+      h2Stream.on("error", () => {
+        clearInterval(heartbeatTimer);
+        try {
+          h2Client.close();
+        } catch {}
+        if (!mcpExecReceived) {
+          send(chunk({}, "stop"));
+          done();
+          close();
+        }
+      });
     }
   });
 }
-function handleToolResultResume(active, toolResults, modelId, tools, accessToken, bridgeKey, res) {
-  const { h2Client, h2Stream, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
+function handleStreaming(payload, accessToken, modelId, sessionKey, logger) {
+  const { client: h2Client, stream: h2Stream } = createH2Stream(accessToken);
+  h2Stream.write(frameConnectMessage(payload.requestBytes));
+  const heartbeatTimer = setInterval(() => {
+    if (!h2Stream.closed && !h2Stream.destroyed)
+      h2Stream.write(makeHeartbeatBytes());
+  }, 5000);
+  const sseStream = buildSSEStream(h2Client, h2Stream, heartbeatTimer, payload, modelId, sessionKey);
+  return new Response(sseStream, {
+    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" }
+  });
+}
+function resumeWithToolResults(session, toolResults, modelId, tools, accessToken, sessionKey, logger) {
+  const { h2Client, h2Stream, heartbeatTimer, blobStore, mcpTools, pendingExecs } = session;
   for (const exec of pendingExecs) {
     const result = toolResults.find((r) => r.toolCallId === exec.toolCallId);
-    const mcpResult = result ? create(McpResultSchema, {
-      result: {
-        case: "success",
-        value: create(McpSuccessSchema, {
-          content: [
-            create(McpToolResultContentItemSchema, {
-              content: {
-                case: "text",
-                value: create(McpTextContentSchema, { text: result.content })
-              }
-            })
-          ],
-          isError: false
-        })
-      }
-    }) : create(McpResultSchema, {
-      result: {
-        case: "error",
-        value: create(McpErrorSchema, { error: "Tool result not provided" })
-      }
-    });
-    const execClientMessage = create(ExecClientMessageSchema, {
-      id: exec.execMsgId,
-      execId: exec.execId,
-      message: { case: "mcpResult", value: mcpResult }
-    });
-    const clientMessage = create(AgentClientMessageSchema, {
-      message: { case: "execClientMessage", value: execClientMessage }
-    });
+    const mcpResult = result ? create(McpResultSchema, { result: { case: "success", value: create(McpSuccessSchema, { content: [create(McpToolResultContentItemSchema, { content: { case: "text", value: create(McpTextContentSchema, { text: result.content }) } })], isError: false }) } }) : create(McpResultSchema, { result: { case: "error", value: create(McpErrorSchema, { error: "Tool result not provided" }) } });
+    const execClient = create(ExecClientMessageSchema, { id: exec.execMsgId, execId: exec.execId, message: { case: "mcpResult", value: mcpResult } });
+    const clientMsg = create(AgentClientMessageSchema, { message: { case: "execClientMessage", value: execClient } });
     if (!h2Stream.closed && !h2Stream.destroyed) {
-      h2Stream.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+      h2Stream.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)));
     }
   }
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
-  const created = Math.floor(Date.now() / 1000);
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive"
-  });
-  let closed = false;
-  const sendSSE = (data) => {
-    if (closed)
-      return;
-    res.write(`data: ${JSON.stringify(data)}
-
-`);
-  };
-  const sendDone = () => {
-    if (closed)
-      return;
-    res.write(`data: [DONE]
-
-`);
-  };
-  const closeResponse = () => {
-    if (closed)
-      return;
-    closed = true;
-    res.end();
-  };
-  const makeChunk = (delta, finishReason = null) => ({
-    id: completionId,
-    object: "chat.completion.chunk",
-    created,
-    model: modelId,
-    choices: [{ index: 0, delta, finish_reason: finishReason }]
-  });
-  const state = {
-    thinkingActive: false,
-    toolCallIndex: 0,
-    pendingExecs: []
-  };
-  let mcpExecReceived = false;
-  let pendingBuffer = Buffer.alloc(0);
   h2Stream.removeAllListeners("data");
   h2Stream.removeAllListeners("end");
   h2Stream.removeAllListeners("error");
+  const sseStream = buildSSEStream(h2Client, h2Stream, heartbeatTimer, { blobStore, mcpTools }, modelId, sessionKey);
+  return new Response(sseStream, {
+    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" }
+  });
+}
+function handleNonStreaming(payload, accessToken, modelId, logger) {
+  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
+  const created = Math.floor(Date.now() / 1000);
+  const { promise, resolve } = Promise.withResolvers();
+  const { client: h2Client, stream: h2Stream } = createH2Stream(accessToken);
+  h2Stream.write(frameConnectMessage(payload.requestBytes));
+  const heartbeatTimer = setInterval(() => {
+    if (!h2Stream.closed && !h2Stream.destroyed)
+      h2Stream.write(makeHeartbeatBytes());
+  }, 5000);
+  let fullText = "";
+  let pendingBuffer = Buffer.alloc(0);
+  const state = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
   h2Stream.on("data", (incoming) => {
     pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
     while (pendingBuffer.length >= 5) {
@@ -5323,182 +5062,50 @@ function handleToolResultResume(active, toolResults, modelId, tools, accessToken
         break;
       const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
       pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-      if (flags & CONNECT_END_STREAM_FLAG) {
-        const endError = parseConnectEndStream(messageBytes);
-        if (endError) {
-          sendSSE(makeChunk({ content: `
-[Error: ${endError.message}]` }));
-        }
+      if (flags & CONNECT_END_STREAM_FLAG)
         continue;
-      }
       try {
-        const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
-        processServerMessage(serverMessage, blobStore, mcpTools, (data) => {
-          if (!h2Stream.closed && !h2Stream.destroyed) {
+        const serverMsg = fromBinary(AgentServerMessageSchema, messageBytes);
+        processServerMessage(serverMsg, payload.blobStore, payload.mcpTools, (data) => {
+          if (!h2Stream.closed && !h2Stream.destroyed)
             h2Stream.write(data);
-          }
-        }, state, (text, isThinking) => {
-          if (isThinking) {
-            if (!state.thinkingActive) {
-              state.thinkingActive = true;
-              sendSSE(makeChunk({ role: "assistant", content: "<think>" }));
-            }
-            sendSSE(makeChunk({ content: text }));
-          } else {
-            if (state.thinkingActive) {
-              state.thinkingActive = false;
-              sendSSE(makeChunk({ content: "</think>" }));
-            }
-            sendSSE(makeChunk({ content: text }));
-          }
-        }, (exec) => {
-          state.pendingExecs.push(exec);
-          mcpExecReceived = true;
-          if (state.thinkingActive) {
-            sendSSE(makeChunk({ content: "</think>" }));
-            state.thinkingActive = false;
-          }
-          const toolCallIndex = state.toolCallIndex++;
-          sendSSE(makeChunk({
-            tool_calls: [{
-              index: toolCallIndex,
-              id: exec.toolCallId,
-              type: "function",
-              function: {
-                name: exec.toolName,
-                arguments: exec.decodedArgs
-              }
-            }]
-          }));
-          activeBridges.set(bridgeKey, {
-            h2Client,
-            h2Stream,
-            heartbeatTimer,
-            blobStore,
-            mcpTools,
-            pendingExecs: state.pendingExecs
-          });
-          sendSSE(makeChunk({}, "tool_calls"));
-          sendDone();
-          closeResponse();
-        });
+        }, state, (text) => {
+          fullText += text;
+        }, () => {});
       } catch {}
     }
   });
   h2Stream.on("end", () => {
     clearInterval(heartbeatTimer);
     h2Client.close();
-    if (!mcpExecReceived) {
-      if (state.thinkingActive) {
-        sendSSE(makeChunk({ content: "</think>" }));
-      }
-      sendSSE(makeChunk({}, "stop"));
-      sendDone();
-      closeResponse();
-    }
+    resolve(fullText);
   });
   h2Stream.on("error", () => {
     clearInterval(heartbeatTimer);
     try {
       h2Client.close();
     } catch {}
-    if (!mcpExecReceived) {
-      sendSSE(makeChunk({ content: `
-[Error: Connection lost]` }));
-      sendSSE(makeChunk({}, "stop"));
-      sendDone();
-      closeResponse();
-    }
+    resolve(fullText);
   });
-}
-async function handleNonStreamingResponse(payload, accessToken, modelId, res) {
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
-  const created = Math.floor(Date.now() / 1000);
-  const fullText = await collectFullResponse(payload, accessToken);
-  res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({
+  const responsePromise = promise.then((text) => new Response(JSON.stringify({
     id: completionId,
     object: "chat.completion",
     created,
     model: modelId,
-    choices: [{
-      index: 0,
-      message: { role: "assistant", content: fullText },
-      finish_reason: "stop"
-    }],
+    choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-  }));
-}
-function collectFullResponse(payload, accessToken) {
-  return new Promise((resolve) => {
-    let fullText = "";
-    const { client: h2Client, stream: h2Stream } = createH2Stream(accessToken);
-    h2Stream.write(frameConnectMessage(payload.requestBytes));
-    const heartbeatTimer = setInterval(() => {
-      if (!h2Stream.closed && !h2Stream.destroyed) {
-        h2Stream.write(makeHeartbeatBytes());
-      }
-    }, 5000);
-    let pendingBuffer = Buffer.alloc(0);
-    const state = {
-      thinkingActive: false,
-      toolCallIndex: 0,
-      pendingExecs: []
-    };
-    h2Stream.on("data", (incoming) => {
-      pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
-      while (pendingBuffer.length >= 5) {
-        const flags = pendingBuffer[0];
-        const msgLen = pendingBuffer.readUInt32BE(1);
-        if (pendingBuffer.length < 5 + msgLen)
-          break;
-        const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
-        pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-        if (flags & CONNECT_END_STREAM_FLAG)
-          continue;
-        try {
-          const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
-          processServerMessage(serverMessage, payload.blobStore, payload.mcpTools, (data) => {
-            if (!h2Stream.closed && !h2Stream.destroyed) {
-              h2Stream.write(data);
-            }
-          }, state, (text) => {
-            fullText += text;
-          }, () => {});
-        } catch {}
-      }
-    });
-    h2Stream.on("end", () => {
-      clearInterval(heartbeatTimer);
-      h2Client.close();
-      resolve(fullText);
-    });
-    h2Stream.on("error", () => {
-      clearInterval(heartbeatTimer);
-      try {
-        h2Client.close();
-      } catch {}
-      resolve(fullText);
-    });
-  });
+  }), { headers: { "Content-Type": "application/json" } }));
+  return responsePromise;
 }
 
 // main.ts
+var CURSOR_BASE_URL2 = "https://api2.cursor.sh";
+var DUMMY_API_KEY = "cursor-oauth";
 async function activate(context) {
   const { logger, storage, providers, commands, ui } = context;
   logger.info("Cursor Auth plugin activating...");
   const tokenStore = new TokenStore(storage.secrets, logger);
   await tokenStore.initialize();
-  let currentProxyPort;
-  const ensureProxy = async () => {
-    if (currentProxyPort)
-      return currentProxyPort;
-    currentProxyPort = await startProxy(async () => {
-      return tokenStore.getValidAccessToken();
-    });
-    logger.info(`Cursor proxy started on port ${currentProxyPort}`);
-    return currentProxyPort;
-  };
   const providerDisposable = providers.register({
     id: "cursor",
     name: "Cursor",
@@ -5514,6 +5121,7 @@ async function activate(context) {
       try {
         const { verifier, uuid, loginUrl } = await generateCursorAuthParams();
         ui.showNotification("Opening browser for Cursor login...", { type: "info" });
+        logger.info("Starting Cursor OAuth flow...");
         openBrowser(loginUrl);
         ui.showNotification("Waiting for Cursor login to complete...", { type: "info" });
         const { accessToken, refreshToken } = await pollCursorAuth(uuid, verifier);
@@ -5534,6 +5142,7 @@ async function activate(context) {
     },
     async logout() {
       await tokenStore.clearTokens();
+      disposeAllSessions();
       ui.showNotification("Logged out from Cursor", { type: "info" });
       logger.info("Cursor logout successful");
     },
@@ -5577,11 +5186,10 @@ async function activate(context) {
       }
     },
     async getSDKConfig() {
-      const port = await ensureProxy();
       return {
-        apiKey: "cursor-proxy",
-        baseURL: `http://localhost:${port}/v1`,
-        fetch: createProxyFetch()
+        apiKey: DUMMY_API_KEY,
+        baseURL: CURSOR_BASE_URL2,
+        fetch: createCursorFetch(() => tokenStore.getValidAccessToken(), logger)
       };
     }
   });
@@ -5590,12 +5198,13 @@ async function activate(context) {
   });
   const logoutCommand = commands.register("logout", async () => {
     await tokenStore.clearTokens();
+    disposeAllSessions();
     ui.showNotification("Logged out from Cursor", { type: "info" });
   });
   const statusCommand = commands.register("status", async () => {
     const isAuth = tokenStore.hasValidToken();
     if (isAuth) {
-      ui.showNotification(`Connected to Cursor${currentProxyPort ? ` (proxy: ${currentProxyPort})` : ""}`, { type: "success" });
+      ui.showNotification("Connected to Cursor", { type: "success" });
     } else {
       ui.showNotification("Not connected to Cursor", { type: "warning" });
     }
@@ -5603,7 +5212,7 @@ async function activate(context) {
   logger.info("Cursor Auth plugin activated");
   return {
     dispose: () => {
-      stopProxy();
+      disposeAllSessions();
       providerDisposable.dispose();
       loginCommand.dispose();
       logoutCommand.dispose();
@@ -5612,23 +5221,8 @@ async function activate(context) {
     }
   };
 }
-function createProxyFetch() {
-  return async (input, init) => {
-    if (init?.headers) {
-      if (init.headers instanceof Headers) {
-        init.headers.delete("authorization");
-        init.headers.delete("Authorization");
-      } else if (Array.isArray(init.headers)) {
-        init.headers = init.headers.filter(([key]) => key.toLowerCase() !== "authorization");
-      } else {
-        delete init.headers["authorization"];
-        delete init.headers["Authorization"];
-      }
-    }
-    return fetch(input, init);
-  };
-}
 function openBrowser(url) {
+  const { exec } = __require("node:child_process");
   const platform = process.platform;
   const cmd = platform === "darwin" ? "open" : platform === "win32" ? "start" : "xdg-open";
   exec(`${cmd} "${url}"`);

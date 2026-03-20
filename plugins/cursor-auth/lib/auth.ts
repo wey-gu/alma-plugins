@@ -3,7 +3,6 @@
  * Handles PKCE-based login, polling, and token refresh.
  */
 
-import { generatePKCE } from './pkce';
 import type { CursorAuthParams, CursorTokens } from './types';
 
 const CURSOR_LOGIN_URL = 'https://cursor.com/loginDeepControl';
@@ -15,9 +14,29 @@ const POLL_BASE_DELAY = 1000;
 const POLL_MAX_DELAY = 10_000;
 const POLL_BACKOFF_MULTIPLIER = 1.2;
 
+// ============================================================================
+// PKCE Helpers
+// ============================================================================
+
+async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
+    const verifierBytes = new Uint8Array(96);
+    crypto.getRandomValues(verifierBytes);
+    const verifier = Buffer.from(verifierBytes).toString('base64url');
+
+    const data = new TextEncoder().encode(verifier);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const challenge = Buffer.from(hashBuffer).toString('base64url');
+
+    return { verifier, challenge };
+}
+
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// ============================================================================
+// OAuth Flow
+// ============================================================================
 
 export async function generateCursorAuthParams(): Promise<CursorAuthParams> {
     const { verifier, challenge } = await generatePKCE();
@@ -50,7 +69,6 @@ export async function pollCursorAuth(
             );
 
             if (response.status === 404) {
-                // User hasn't completed login yet
                 consecutiveErrors = 0;
                 delay = Math.min(delay * POLL_BACKOFF_MULTIPLIER, POLL_MAX_DELAY);
                 continue;
@@ -81,6 +99,10 @@ export async function pollCursorAuth(
     throw new Error('Cursor authentication polling timeout');
 }
 
+// ============================================================================
+// Token Refresh
+// ============================================================================
+
 export async function refreshCursorToken(
     refreshToken: string,
 ): Promise<CursorTokens> {
@@ -110,6 +132,10 @@ export async function refreshCursorToken(
     };
 }
 
+// ============================================================================
+// JWT Helpers
+// ============================================================================
+
 /**
  * Extract JWT expiry with 5-minute safety margin.
  * Falls back to 1 hour from now if token can't be parsed.
@@ -128,11 +154,17 @@ export function getTokenExpiry(token: string): number {
             typeof decoded === 'object' &&
             typeof decoded.exp === 'number'
         ) {
-            // 5-minute safety margin before actual expiry
             return decoded.exp * 1000 - 5 * 60 * 1000;
         }
     } catch {
         // Ignore parsing errors
     }
     return Date.now() + 3600 * 1000;
+}
+
+/**
+ * Check if a token is expired (with buffer already baked into expires_at)
+ */
+export function isTokenExpired(expiresAt: number): boolean {
+    return Date.now() >= expiresAt;
 }

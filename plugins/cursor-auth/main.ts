@@ -2,21 +2,30 @@
  * Cursor Auth Plugin for Alma
  *
  * Enables using Cursor subscription models (Claude, GPT, Gemini, etc.)
- * inside Alma via:
- * 1. Browser-based OAuth login to Cursor
- * 2. Dynamic model discovery from Cursor's gRPC API
- * 3. Local proxy translating OpenAI format -> Cursor gRPC protocol
+ * inside Alma via OAuth authentication. This plugin registers a custom
+ * provider that handles authentication and API calls to the Cursor backend.
+ *
+ * IMPORTANT: This follows the same pattern as openai-codex-auth:
+ * - Plugin returns { apiKey, baseURL, fetch } configuration
+ * - Custom fetch wrapper handles gRPC translation, OAuth headers, etc.
+ * - AI SDK handles all request/response logic using the provided config
  *
  * DISCLAIMER: This plugin is for personal development use only with your
  * own Cursor subscription. Not for commercial resale or multi-user services.
  */
 
 import type { PluginContext, PluginActivation } from 'alma-plugin-api';
-import { exec } from 'node:child_process';
 import { TokenStore } from './lib/token-store';
 import { generateCursorAuthParams, pollCursorAuth, getTokenExpiry } from './lib/auth';
 import { getCursorModels, getFallbackModels } from './lib/models';
-import { startProxy, stopProxy } from './lib/proxy';
+import { createCursorFetch, disposeAllSessions } from './lib/cursor-fetch';
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const CURSOR_BASE_URL = 'https://api2.cursor.sh';
+const DUMMY_API_KEY = 'cursor-oauth';
 
 // ============================================================================
 // Plugin Activation
@@ -30,24 +39,6 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     // Initialize token store
     const tokenStore = new TokenStore(storage.secrets, logger);
     await tokenStore.initialize();
-
-    // Proxy port (set when proxy starts)
-    let currentProxyPort: number | undefined;
-
-    // =========================================================================
-    // Proxy Management
-    // =========================================================================
-
-    const ensureProxy = async (): Promise<number> => {
-        if (currentProxyPort) return currentProxyPort;
-
-        currentProxyPort = await startProxy(async () => {
-            return tokenStore.getValidAccessToken();
-        });
-
-        logger.info(`Cursor proxy started on port ${currentProxyPort}`);
-        return currentProxyPort;
-    };
 
     // =========================================================================
     // Register Provider
@@ -73,10 +64,11 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
                 ui.showNotification('Opening browser for Cursor login...', { type: 'info' });
 
-                // Open browser for login
+                // Start OAuth flow — Cursor uses poll-based auth (no callback redirect)
+                // Open browser and poll for login completion
+                logger.info('Starting Cursor OAuth flow...');
                 openBrowser(loginUrl);
 
-                // Poll for auth completion
                 ui.showNotification('Waiting for Cursor login to complete...', { type: 'info' });
 
                 const { accessToken, refreshToken } = await pollCursorAuth(uuid, verifier);
@@ -101,12 +93,12 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
         async logout() {
             await tokenStore.clearTokens();
+            disposeAllSessions();
             ui.showNotification('Logged out from Cursor', { type: 'info' });
             logger.info('Cursor logout successful');
         },
 
         async getModels() {
-            // Return fallback models when not authenticated
             const tokens = tokenStore.getTokens();
             const models = tokens
                 ? await getCursorModels(tokens.access_token).catch(() => getFallbackModels())
@@ -152,16 +144,20 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         },
 
         /**
-         * Returns SDK configuration for AI SDK.
-         * Points to the local proxy which handles all Cursor protocol translation.
+         * Returns SDK configuration for AI SDK's createOpenAI().
+         * This follows the openai-codex-auth pattern:
+         * - apiKey: Dummy key (actual auth via OAuth)
+         * - baseURL: Cursor API URL (custom fetch intercepts and translates)
+         * - fetch: Custom fetch that handles gRPC translation
          */
         async getSDKConfig() {
-            const port = await ensureProxy();
-
             return {
-                apiKey: 'cursor-proxy',
-                baseURL: `http://localhost:${port}/v1`,
-                fetch: createProxyFetch(),
+                apiKey: DUMMY_API_KEY,
+                baseURL: CURSOR_BASE_URL,
+                fetch: createCursorFetch(
+                    () => tokenStore.getValidAccessToken(),
+                    logger,
+                ),
             };
         },
     } as any);
@@ -176,16 +172,14 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
     const logoutCommand = commands.register('logout', async () => {
         await tokenStore.clearTokens();
+        disposeAllSessions();
         ui.showNotification('Logged out from Cursor', { type: 'info' });
     });
 
     const statusCommand = commands.register('status', async () => {
         const isAuth = tokenStore.hasValidToken();
         if (isAuth) {
-            ui.showNotification(
-                `Connected to Cursor${currentProxyPort ? ` (proxy: ${currentProxyPort})` : ''}`,
-                { type: 'success' },
-            );
+            ui.showNotification('Connected to Cursor', { type: 'success' });
         } else {
             ui.showNotification('Not connected to Cursor', { type: 'warning' });
         }
@@ -199,7 +193,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
     return {
         dispose: () => {
-            stopProxy();
+            disposeAllSessions();
             providerDisposable.dispose();
             loginCommand.dispose();
             logoutCommand.dispose();
@@ -214,38 +208,13 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 // ============================================================================
 
 /**
- * Create a custom fetch that strips dummy auth headers.
- * The proxy handles authentication internally.
- */
-function createProxyFetch(): typeof globalThis.fetch {
-    return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        if (init?.headers) {
-            if (init.headers instanceof Headers) {
-                init.headers.delete('authorization');
-                init.headers.delete('Authorization');
-            } else if (Array.isArray(init.headers)) {
-                init.headers = init.headers.filter(
-                    ([key]) => key.toLowerCase() !== 'authorization',
-                );
-            } else {
-                delete (init.headers as Record<string, string>)['authorization'];
-                delete (init.headers as Record<string, string>)['Authorization'];
-            }
-        }
-
-        return fetch(input, init);
-    };
-}
-
-/**
  * Open a URL in the default browser.
  */
 function openBrowser(url: string): void {
+    const { exec } = require('node:child_process');
     const platform = process.platform;
-    const cmd = platform === 'darwin'
-        ? 'open'
-        : platform === 'win32'
-            ? 'start'
-            : 'xdg-open';
+    const cmd = platform === 'darwin' ? 'open'
+        : platform === 'win32' ? 'start'
+        : 'xdg-open';
     exec(`${cmd} "${url}"`);
 }
