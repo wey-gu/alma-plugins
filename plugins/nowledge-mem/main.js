@@ -245,7 +245,7 @@ class NowledgeMemClient {
 	}
 
 	async searchThreads(query, limit = 5, source) {
-		const args = ["--json", "t", "search", query, "--limit", String(clamp(Number(limit) || 5, 1, 50))];
+		const args = ["--json", "t", "search", query, "-n", String(clamp(Number(limit) || 5, 1, 50))];
 		if (source) args.push("--source", String(source));
 		return this.run(args, true);
 	}
@@ -256,7 +256,7 @@ class NowledgeMemClient {
 			"t",
 			"show",
 			String(id),
-			"--limit",
+			"-n",
 			String(Math.max(1, Math.floor(messages))),
 			"--content-limit",
 			String(Math.max(100, Math.floor(contentLimit))),
@@ -406,10 +406,23 @@ function buildCliPlaybookBlock() {
 		"- Show memory: `nmem --json m show <memory_id>`",
 		"- Add memory: `nmem --json m add \"<content>\" -t \"<title>\" -l tag1 -l tag2 --unit-type decision`",
 		"- Update memory: `nmem --json m update <memory_id> -c \"<new_content>\"`",
-		"- Search threads: `nmem --json t search \"<query>\" --limit 5 --source alma`",
-		"- Show thread: `nmem --json t show <thread_id> --limit 30 --offset 0 --content-limit 1200`",
+		"- Search threads: `nmem --json t search \"<query>\" -n 5 --source alma`",
+		"- Show thread: `nmem --json t show <thread_id> -n 30 --offset 0 --content-limit 1200`",
 	];
 }
+
+/**
+ * Behavioral guidance lines injected into user messages.
+ *
+ * Always injected (even when no WM or recall results exist) so the AI
+ * knows about Nowledge Mem tools from the very first message.
+ */
+const BEHAVIORAL_GUIDANCE = [
+	"Use Nowledge Mem as the primary memory system for recall/store/update operations.",
+	"For any request about past context/decisions/history/memory, prefer a Nowledge Mem tool call before finalizing the answer.",
+	"When the conversation produces something worth keeping — a decision, preference, insight, plan, fact about the user or their work — save it with nowledge_mem_store. Don't wait to be asked; even casual conversations may surface preferences or facts worth remembering.",
+	"When a memory has a sourceThreadId, fetch the full conversation with nowledge_mem_thread_show for deeper context.",
+];
 
 function buildMemoryContextBlock(workingMemory, results, options = {}) {
 	const includeCliPlaybook = options.includeCliPlaybook === true;
@@ -429,31 +442,26 @@ function buildMemoryContextBlock(workingMemory, results, options = {}) {
 		);
 	}
 
-	if (sections.length === 0) return "";
-
-	const generatedAt = new Date().toISOString();
-	const memoryCount = Array.isArray(results) ? results.length : 0;
-
-	return [
+	const lines = [
 		"<nowledge-mem-central-context>",
-		`meta: mode=injected_context generated_at=${generatedAt} memory_count=${memoryCount}`,
-		"This block is preloaded by plugin hook and is NOT equivalent to live tool execution output.",
-		"If you answer using this block only, explicitly disclose that no tool call executed in this turn.",
-		"Use Nowledge Mem as the primary memory system for recall/store/update operations.",
-		"For any request about past context/decisions/history/memory, prefer a Nowledge Mem tool call before finalizing the answer.",
-		"Preferred order: nowledge-mem.nowledge_mem_query -> nowledge-mem.nowledge_mem_search -> nowledge-mem.nowledge_mem_thread_search.",
-		"If tool call format needs short ids, use nowledge_mem_query / nowledge_mem_search / nowledge_mem_thread_search.",
-		"Do not claim memory tools are unavailable unless tool execution actually fails in this turn.",
-		"Do not present injected context as fresh retrieval. If no tool was executed, label it as recalled context/hint.",
-		"Prefer nowledge_mem_search/nowledge_mem_store/nowledge_mem_update/nowledge_mem_delete/nowledge_mem_working_memory over local ephemeral memory paths.",
-		"When the conversation produces something worth keeping — a decision, preference, insight, plan — save it with nowledge_mem_store. Don't wait to be asked.",
-		"When a memory has a sourceThreadId, fetch the full conversation with nowledge_mem_thread_show for deeper context.",
-		"",
-		...sections,
-		...(includeCliPlaybook ? ["", ...buildCliPlaybookBlock()] : []),
-		"",
-		"</nowledge-mem-central-context>",
-	].join("\n");
+		...BEHAVIORAL_GUIDANCE,
+	];
+
+	if (sections.length > 0) {
+		lines.push(
+			"This block is preloaded by plugin hook and is NOT equivalent to live tool execution output.",
+			"If you answer using this block only, explicitly disclose that no tool call executed in this turn.",
+			"",
+			...sections,
+		);
+	}
+
+	if (includeCliPlaybook) {
+		lines.push("", ...buildCliPlaybookBlock());
+	}
+
+	lines.push("", "</nowledge-mem-central-context>");
+	return lines.join("\n");
 }
 
 function normalizeThreadMessages(messages) {
@@ -523,7 +531,7 @@ export async function activate(context) {
 
 	let recallPolicy = resolveRecallPolicy(context.settings, logger);
 	let autoCapture = Boolean(
-		getSetting(context.settings, "nowledgeMem.autoCapture", false),
+		getSetting(context.settings, "nowledgeMem.autoCapture", true),
 	);
 	let maxRecallResults = clamp(
 		Number(getSetting(context.settings, "nowledgeMem.maxRecallResults", 5)) ||
@@ -550,7 +558,7 @@ export async function activate(context) {
 					);
 				}
 				recallPolicy = resolveRecallPolicy(context.settings, logger);
-				autoCapture = Boolean(getSetting(context.settings, "nowledgeMem.autoCapture", false));
+				autoCapture = Boolean(getSetting(context.settings, "nowledgeMem.autoCapture", true));
 				maxRecallResults = clamp(
 					Number(getSetting(context.settings, "nowledgeMem.maxRecallResults", 5)) || 5, 1, 20,
 				);
@@ -588,14 +596,16 @@ export async function activate(context) {
 		if (disposable?.dispose) disposables.push(disposable);
 	};
 
+	// Use context.events (canonical Alma API) first, context.hooks as legacy fallback.
+	const eventsAPI = context.events ?? context.hooks;
 	const registerEvent = (eventName, handler) => {
-		let disposable;
-		if (context.hooks?.on) {
-			disposable = context.hooks.on(eventName, handler);
-		} else if (context.events?.on) {
-			disposable = context.events.on(eventName, handler);
+		if (!eventsAPI?.on) {
+			logger.warn?.(`nowledge-mem: no events API available, cannot register ${eventName}`);
+			return false;
 		}
+		const disposable = eventsAPI.on(eventName, handler);
 		if (disposable?.dispose) disposables.push(disposable);
+		logger.info?.(`nowledge-mem: registered hook ${eventName} → ${!!disposable}`);
 		return Boolean(disposable);
 	};
 
@@ -1294,36 +1304,186 @@ export async function activate(context) {
 		},
 	});
 
-	if (recallInjectionEnabled) {
-		registerEvent("chat.message.willSend", async (first, second) => {
-			const payload = normalizeWillSendPayload(first, second);
-			const { threadId, currentContent } = payload;
-			if (!currentContent || !currentContent.trim()) return;
+	// -- Live thread sync state --
+	// Accumulate messages from hook payloads (willSend = user, didReceive = AI).
+	// Never rely on context.chat.getMessages() — not all Alma versions expose it,
+	// and timing may cause it to miss the latest message.
+	const MAX_THREAD_BUFFERS = 20;
+	const threadBuffers = new Map(); // threadId → { title, messages: [{role,content}] }
+	const savedMessageCounts = new Map(); // threadId → last saved msg count
+	let idleSaveTimer = null;
+	let activeThreadId = null;
 
-			const allowAutoRecall =
-				currentContent.length >= 8 &&
-				!(recallFrequency === "thread_once" && recalledThreads.has(threadId));
+	/** Resolve the best possible thread title via Alma APIs, falling back to first user message. */
+	const resolveTitle = async (threadId, buf) => {
+		try {
+			const chat = context.chat;
+			// Strategy 1: getThread(id) — specific thread by ID
+			if (chat?.getThread) {
+				try {
+					const t = await chat.getThread(threadId);
+					if (t?.title && typeof t.title === "string" && t.title.trim()) return t.title.trim();
+				} catch (_) {}
+			}
+			// Strategy 2: getActiveThread
+			if (chat?.getActiveThread) {
+				try {
+					const t = await chat.getActiveThread();
+					if (t?.title && typeof t.title === "string" && t.title.trim()) return t.title.trim();
+				} catch (_) {}
+			}
+			// Strategy 3: listThreads and find by ID
+			if (chat?.listThreads) {
+				try {
+					const threads = await chat.listThreads();
+					const t = Array.isArray(threads) ? threads.find((th) => th?.id === threadId) : null;
+					if (t?.title && typeof t.title === "string" && t.title.trim()) return t.title.trim();
+				} catch (_) {}
+			}
+		} catch (_) {}
+		// Strategy 4: derive from first user message
+		const firstUserMsg = buf.messages.find((m) => m.role === "user");
+		if (firstUserMsg?.content) {
+			const raw = firstUserMsg.content.replace(/\s+/g, " ").trim();
+			return raw.length > 80 ? raw.slice(0, 77) + "..." : raw;
+		}
+		return null;
+	};
 
-			if (allowAutoRecall) {
-				const wm = await client.readWorkingMemory();
-				const results = await client.search(currentContent, maxRecallResults);
-				const contextBlock = buildMemoryContextBlock(wm, results, {
-					includeCliPlaybook: injectCliPlaybook,
-				});
-				if (!contextBlock) return;
-				if (payload.setContent(`${contextBlock}\n\n${currentContent}`)) {
-					if (allowAutoRecall && recallFrequency === "thread_once") {
-						recalledThreads.add(threadId);
-					}
+	/** Flush a thread buffer to Nowledge Mem if it has new messages. */
+	const flushThread = async (threadId) => {
+		const buf = threadBuffers.get(threadId);
+		if (!buf || buf.messages.length < 2) return;
+		const lastSaved = savedMessageCounts.get(threadId) || 0;
+		if (buf.messages.length <= lastSaved) return;
+
+		// Cancel idle timer — we're flushing now
+		if (idleSaveTimer) { clearTimeout(idleSaveTimer); idleSaveTimer = null; }
+
+		// Resolve title right before saving (Alma generates titles asynchronously)
+		const resolved = await resolveTitle(threadId, buf);
+		if (resolved) buf.title = escapeForInline(resolved, 120);
+		logger.info?.(`nowledge-mem: flushing ${threadId} (${buf.messages.length} msgs, title="${buf.title}")`);
+
+		try {
+			const summary = buf.messages
+				.slice(-8)
+				.map((msg) => `[${msg.role}] ${escapeForInline(msg.content, 280)}`)
+				.join("\n");
+			await client.createThread(
+				buf.title,
+				escapeForInline(summary, 1200),
+				buf.messages,
+				"alma",
+			);
+			savedMessageCounts.set(threadId, buf.messages.length);
+			logger.info?.(`nowledge-mem: thread synced (${threadId}, ${buf.messages.length} msgs)`);
+		} catch (err) {
+			logger.error?.(`nowledge-mem: thread sync failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	};
+
+	const resetIdleTimer = (threadId) => {
+		if (idleSaveTimer) clearTimeout(idleSaveTimer);
+		idleSaveTimer = setTimeout(() => {
+			idleSaveTimer = null;
+			flushThread(threadId);
+		}, 7_000);
+	};
+
+	const ensureBuffer = (threadId) => {
+		if (!threadBuffers.has(threadId)) {
+			// Evict oldest buffer if at capacity (prevent unbounded memory growth)
+			if (threadBuffers.size >= MAX_THREAD_BUFFERS) {
+				const oldest = threadBuffers.keys().next().value;
+				threadBuffers.delete(oldest);
+				savedMessageCounts.delete(oldest);
+			}
+			threadBuffers.set(threadId, {
+				title: escapeForInline(`Alma Thread ${new Date().toISOString().slice(0, 10)}`, 120),
+				messages: [],
+			});
+		}
+		return threadBuffers.get(threadId);
+	};
+
+	// --- Hook: willSend (recall injection + capture user message) ---
+	registerEvent("chat.message.willSend", async (first, second) => {
+		const payload = normalizeWillSendPayload(first, second);
+		const { threadId, currentContent } = payload;
+
+		// Capture user message into buffer
+		if (autoCapture && currentContent && currentContent.trim()) {
+			const buf = ensureBuffer(threadId);
+			buf.messages.push({ role: "user", content: currentContent });
+			activeThreadId = threadId;
+			logger.debug?.(`nowledge-mem: buffered user msg for ${threadId} (${buf.messages.length} total)`);
+		}
+
+		// Recall injection
+		if (!recallInjectionEnabled) return;
+		if (!currentContent || !currentContent.trim()) return;
+
+		const allowAutoRecall =
+			currentContent.length >= 8 &&
+			!(recallFrequency === "thread_once" && recalledThreads.has(threadId));
+
+		if (allowAutoRecall) {
+			const wm = await client.readWorkingMemory();
+			const results = await client.search(currentContent, maxRecallResults);
+			const contextBlock = buildMemoryContextBlock(wm, results, {
+				includeCliPlaybook: injectCliPlaybook,
+			});
+			if (!contextBlock) return;
+			if (payload.setContent(`${contextBlock}\n\n${currentContent}`)) {
+				if (allowAutoRecall && recallFrequency === "thread_once") {
+					recalledThreads.add(threadId);
 				}
 			}
-		});
-	}
+		}
+	});
 
+	// --- Hook: didReceive (capture AI response + start idle timer) ---
 	if (autoCapture) {
+		registerEvent("chat.message.didReceive", (input, _output) => {
+			const threadId = input?.threadId;
+			const aiContent = input?.response?.content;
+			logger.debug?.(`nowledge-mem: didReceive fired, threadId=${threadId}, hasContent=${!!aiContent}`);
+			if (!threadId) return;
+			if (typeof aiContent !== "string" || !aiContent.trim()) return;
+
+			const buf = ensureBuffer(threadId);
+			buf.messages.push({ role: "assistant", content: aiContent });
+			activeThreadId = threadId;
+			logger.debug?.(`nowledge-mem: buffered AI msg for ${threadId} (${buf.messages.length} total)`);
+			resetIdleTimer(threadId);
+		});
+
+		// --- Hook: thread.activated (flush on thread switch) ---
+		registerEvent("thread.activated", async (input, _output) => {
+			const newThreadId = input?.threadId;
+			logger.debug?.(`nowledge-mem: thread.activated fired, threadId=${newThreadId}`);
+			if (idleSaveTimer) {
+				clearTimeout(idleSaveTimer);
+				idleSaveTimer = null;
+			}
+			// Flush the previous thread (await to avoid race with new thread's hooks)
+			if (activeThreadId && activeThreadId !== newThreadId) {
+				await flushThread(activeThreadId);
+			}
+			if (newThreadId) activeThreadId = newThreadId;
+		});
+
+		// --- Quit hooks as safety net ---
 		const handleAutoCapture = async (_input, output) => {
 			quitCaptureAttempted = true;
 			try {
+				if (idleSaveTimer) {
+					clearTimeout(idleSaveTimer);
+					idleSaveTimer = null;
+				}
+				// Flush buffered thread, then try saveActiveThread as fallback
+				if (activeThreadId) await flushThread(activeThreadId);
 				const message = await saveActiveThread(context, client);
 				logger.info?.(`nowledge-mem: auto-capture on quit (${message})`);
 			} catch (err) {
@@ -1340,6 +1500,16 @@ export async function activate(context) {
 		registerEvent("app.will-quit", handleAutoCapture);
 		registerEvent("app.beforeQuit", handleAutoCapture);
 		registerEvent("app.before-quit", handleAutoCapture);
+
+		// Cleanup disposable for the idle timer
+		disposables.push({
+			dispose() {
+				if (idleSaveTimer) {
+					clearTimeout(idleSaveTimer);
+					idleSaveTimer = null;
+				}
+			},
+		});
 	}
 
 	const remoteMode = apiUrl && apiUrl !== "http://127.0.0.1:14242";
@@ -1361,7 +1531,7 @@ export async function activate(context) {
 export async function deactivate(context) {
 	const logger = context?.logger ?? console;
 	const autoCapture = Boolean(
-		getSetting(context?.settings, "nowledgeMem.autoCapture", false),
+		getSetting(context?.settings, "nowledgeMem.autoCapture", true),
 	);
 	if (!autoCapture || quitCaptureAttempted) {
 		logger.info?.("nowledge-mem deactivated");
