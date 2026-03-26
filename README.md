@@ -2,6 +2,13 @@
 
 Official and example plugins for [Alma](https://alma.now).
 
+> [!IMPORTANT]
+> **Antigravity Plugin Has Been Removed**
+>
+> The Antigravity Auth plugin has been removed from this repository. Google Antigravity IDE employs very aggressive anti-reverse-proxy measures that change far too frequently. As a solo maintainer, I simply don't have the bandwidth to keep up with their constant updates — each change requires significant reverse-engineering and debugging effort. Rather than letting the plugin stay broken indefinitely, I've decided to remove it entirely.
+>
+> I appreciate your understanding. If the situation improves in the future, I may consider bringing it back.
+
 ## Plugin Types
 
 Alma supports several types of plugins:
