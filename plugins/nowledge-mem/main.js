@@ -1460,6 +1460,15 @@ export async function activate(context) {
 
 	return {
 		dispose() {
+			// Flush any unsynced thread buffers before tearing down.
+			// This covers plugin disable/reload paths where quit hooks may not fire.
+			for (const [threadId, buf] of threadBuffers) {
+				if (buf.messages.length > buf.savedCount && !buf.flushing) {
+					flushThread(threadId).catch((err) =>
+						logger.error?.(`nowledge-mem: dispose flush failed for ${threadId}: ${err}`),
+					);
+				}
+			}
 			for (const d of disposables) {
 				try { d.dispose(); } catch { /* best effort */ }
 			}
@@ -1471,7 +1480,7 @@ export async function activate(context) {
 
 export async function deactivate(context) {
 	const logger = context?.logger ?? console;
-	// Thread buffers are flushed by quit hooks registered in activate().
-	// deactivate() cannot access those buffers (they're scoped to activate's closure).
+	// Thread buffers are flushed by dispose() (scoped to activate's closure).
+	// deactivate() is called externally and cannot access those buffers directly.
 	logger.info?.("nowledge-mem deactivated");
 }
