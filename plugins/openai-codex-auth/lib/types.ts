@@ -11,6 +11,41 @@ export interface CodexTokens {
     refresh_token: string;
     expires_at: number; // Unix timestamp in milliseconds
     account_id: string; // ChatGPT account ID extracted from JWT
+    id_token?: string;  // Raw OIDC id_token from token endpoint (used for profile claims)
+}
+
+/** User-facing claims extracted from access_token / id_token JWTs. */
+export interface CodexAccountClaims {
+    accountId: string;
+    email?: string;
+    picture?: string;
+    plan?: string;
+}
+
+/** A single ChatGPT account (tokens + cached profile/quota). */
+export interface CodexAccountRecord {
+    id: string;        // Same as tokens.account_id — duplicated for stable key access
+    tokens: CodexTokens;
+    email?: string;
+    picture?: string;
+    plan?: string;
+    quota?: CodexAccountQuota;
+}
+
+/** Per-limit quota info returned to the host via ProviderAccountInfo.quota. */
+export interface CodexQuotaEntry {
+    name: string;           // e.g. "primary", "secondary", "codex (primary)"
+    percentage: number;     // Remaining percentage (0-100), i.e. 100 - used_percent
+    resetTime: string;      // ISO 8601
+}
+
+export interface CodexAccountQuota {
+    models: CodexQuotaEntry[];
+    lastUpdated: number;
+    /** Optional plan type reported by backend (e.g. "plus", "pro"). */
+    planType?: string;
+    /** True if the backend reported rate_limit_reached. */
+    rateLimitReached?: boolean;
 }
 
 export interface PKCEChallenge {

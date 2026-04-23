@@ -5,7 +5,7 @@
  * Uses manual code copy method (similar to Claude Subscription).
  */
 
-import type { PKCEChallenge, OAuthConfig, CodexTokens } from './types';
+import type { PKCEChallenge, OAuthConfig, CodexTokens, CodexAccountClaims } from './types';
 
 // ============================================================================
 // OAuth Configuration
@@ -125,6 +125,7 @@ export async function exchangeCodeForTokens(
         refresh_token: data.refresh_token,
         expires_at: Date.now() + data.expires_in * 1000,
         account_id: accountId,
+        id_token: typeof data.id_token === 'string' ? data.id_token : undefined,
     };
 }
 
@@ -161,6 +162,7 @@ export async function refreshTokens(refreshToken: string): Promise<CodexTokens> 
         refresh_token: data.refresh_token || refreshToken, // Keep old refresh token if not provided
         expires_at: Date.now() + data.expires_in * 1000,
         account_id: accountId,
+        id_token: typeof data.id_token === 'string' ? data.id_token : undefined,
     };
 }
 
@@ -208,6 +210,71 @@ export function extractAccountIdFromJWT(accessToken: string): string {
     } catch (error) {
         throw new Error(`Failed to extract account ID: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
+}
+
+/**
+ * Extract account/profile claims from access_token (and optional id_token).
+ * Matches the claim shape used by the official Codex CLI (`IdTokenInfo`),
+ * extended with the OIDC-standard `picture` claim.
+ *
+ * Precedence: access_token first, id_token only used to fill gaps.
+ */
+export function extractAccountClaims(
+    accessToken: string,
+    idToken?: string
+): CodexAccountClaims {
+    const primary = safeDecodeJWT(accessToken) ?? {};
+    const secondary = idToken ? (safeDecodeJWT(idToken) ?? {}) : {};
+
+    const accountId =
+        readString(primary, ['https://api.openai.com/auth', 'chatgpt_account_id']) ||
+        readString(secondary, ['https://api.openai.com/auth', 'chatgpt_account_id']) ||
+        readString(primary, ['sub']) ||
+        readString(secondary, ['sub']) ||
+        '';
+
+    if (!accountId) {
+        throw new Error('Could not find account ID in token');
+    }
+
+    const email =
+        readString(primary, ['email']) ||
+        readString(secondary, ['email']) ||
+        readString(primary, ['https://api.openai.com/profile', 'email']) ||
+        readString(secondary, ['https://api.openai.com/profile', 'email']);
+
+    const picture =
+        readString(secondary, ['picture']) ||
+        readString(primary, ['picture']) ||
+        readString(secondary, ['https://api.openai.com/profile', 'picture']) ||
+        readString(primary, ['https://api.openai.com/profile', 'picture']);
+
+    const plan =
+        readString(primary, ['https://api.openai.com/auth', 'chatgpt_plan_type']) ||
+        readString(secondary, ['https://api.openai.com/auth', 'chatgpt_plan_type']);
+
+    return { accountId, email, picture, plan };
+}
+
+function safeDecodeJWT(token: string): Record<string, unknown> | null {
+    try {
+        return decodeJWT(token);
+    } catch {
+        return null;
+    }
+}
+
+/** Read a string at a nested path, returning undefined if any hop is missing. */
+function readString(obj: Record<string, unknown>, path: string[]): string | undefined {
+    let cur: unknown = obj;
+    for (const key of path) {
+        if (cur && typeof cur === 'object' && key in (cur as Record<string, unknown>)) {
+            cur = (cur as Record<string, unknown>)[key];
+        } else {
+            return undefined;
+        }
+    }
+    return typeof cur === 'string' && cur.length > 0 ? cur : undefined;
 }
 
 /**

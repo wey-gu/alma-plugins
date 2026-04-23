@@ -20,6 +20,8 @@ import { getAuthorizationUrl, exchangeCodeForTokens } from './lib/auth';
 import { getActiveModels, setCachedModels, buildModelsFromApiResponse, getBaseModelId, getReasoningEffort } from './lib/models';
 import { getCodexInstructions } from './lib/codex-instructions';
 import { addAlmaBridgeMessage } from './lib/alma-codex-bridge';
+import { fetchAccountQuota } from './lib/rate-limits';
+import { fetchAccountProfile, avatarUrlForEmail } from './lib/profile';
 
 // ============================================================================
 // Constants (matching opencode-openai-codex-auth)
@@ -506,14 +508,64 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     // Register Provider
     // =========================================================================
 
+    // =========================================================================
+    // Helpers for multi-account UI exposure
+    // =========================================================================
+
+    /** Best-effort quota refresh for one account — never throws. */
+    const refreshQuotaForAccount = async (accountId: string): Promise<void> => {
+        try {
+            const accessToken = await tokenStore.getValidAccessTokenFor(accountId);
+            const quota = await fetchAccountQuota(accessToken, accountId, logger);
+            await tokenStore.setAccountQuota(accountId, quota);
+        } catch (error) {
+            logger.warn(`[codex quota] refresh failed for ${accountId}:`, error);
+        }
+    };
+
+    /** Best-effort profile fetch (avatar + name) — never throws. */
+    const refreshProfileForAccount = async (accountId: string): Promise<void> => {
+        try {
+            const accessToken = await tokenStore.getValidAccessTokenFor(accountId);
+            const record = tokenStore.getAccount(accountId);
+
+            // Remote profile endpoint — reserved; currently returns null for
+            // CLI tokens (ChatGPT's /me is Cloudflare-gated).
+            const profile = await fetchAccountProfile(accessToken, accountId, logger);
+            if (profile) await tokenStore.setAccountProfile(accountId, profile);
+
+            // Gravatar fallback from email. We skip it when the record already
+            // has a picture (e.g. from a future real endpoint) to avoid
+            // clobbering the better value.
+            if (record && !record.picture && record.email) {
+                const gravatar = await avatarUrlForEmail(record.email);
+                if (gravatar) await tokenStore.setAccountProfile(accountId, { picture: gravatar });
+            }
+        } catch (error) {
+            logger.warn(`[codex profile] refresh failed for ${accountId}:`, error);
+        }
+    };
+
     const providerDisposable = providers.register({
         id: 'openai-codex',
         name: 'OpenAI Codex (ChatGPT)',
         description: 'Access GPT-5.3 Codex and other models via your ChatGPT subscription',
         authType: 'oauth',
+        supportsMultiAccount: true,
 
         async initialize() {
             logger.info('Codex provider initialized');
+
+            // Warm quota + profile caches in the background so the settings
+            // page shows fresh data the first time it renders. Non-blocking.
+            void (async () => {
+                for (const record of tokenStore.listAccounts()) {
+                    await Promise.all([
+                        refreshQuotaForAccount(record.id),
+                        refreshProfileForAccount(record.id),
+                    ]);
+                }
+            })();
         },
 
         async isAuthenticated() {
@@ -552,11 +604,17 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 }
 
                 const tokens = await exchangeCodeForTokens(result.code, pendingVerifier);
-                await tokenStore.saveTokens(tokens);
+                const record = await tokenStore.saveTokens(tokens);
                 await tokenStore.clearPendingState();
 
-                ui.showNotification('Successfully connected to ChatGPT!', { type: 'success' });
-                logger.info('Codex authentication successful');
+                // Fetch quota + profile in the background; failure must not
+                // block login.
+                void refreshQuotaForAccount(record.id);
+                void refreshProfileForAccount(record.id);
+
+                const label = record.email ? ` (${record.email})` : '';
+                ui.showNotification(`Successfully connected to ChatGPT${label}!`, { type: 'success' });
+                logger.info(`Codex authentication successful for ${record.id}`);
 
                 return { success: true };
             } catch (error) {
@@ -571,6 +629,41 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             await tokenStore.clearTokens();
             ui.showNotification('Logged out from ChatGPT', { type: 'info' });
             logger.info('Codex logout successful');
+        },
+
+        // =====================================================================
+        // Multi-account: accounts listing, removal, quota refresh
+        // =====================================================================
+
+        async getAccounts() {
+            return tokenStore.listAccounts().map(record => ({
+                id: record.id,
+                email: record.email,
+                label: record.plan ? `ChatGPT ${record.plan}` : undefined,
+                avatarUrl: record.picture,
+                isRateLimited: record.quota?.rateLimitReached === true,
+                quota: record.quota
+                    ? {
+                          models: record.quota.models,
+                          lastUpdated: record.quota.lastUpdated,
+                      }
+                    : undefined,
+            }));
+        },
+
+        async removeAccount(accountId: string) {
+            await tokenStore.removeAccount(accountId);
+            ui.showNotification('Account removed', { type: 'info' });
+        },
+
+        async refreshQuotas() {
+            const accounts = tokenStore.listAccounts();
+            await Promise.all(
+                accounts.flatMap(a => [
+                    refreshQuotaForAccount(a.id),
+                    refreshProfileForAccount(a.id),
+                ])
+            );
         },
 
         async getModels() {
