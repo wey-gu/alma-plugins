@@ -78,10 +78,26 @@ export interface ToolResultInfo {
     content: string;
 }
 
+export interface HistoryToolCall {
+    toolCallId: string;
+    toolName: string;
+    /** Stringified JSON arguments. */
+    argsJson: string;
+    /** Tool result text, when known. Undefined => result was not paired in the prompt. */
+    resultText?: string;
+    isError?: boolean;
+}
+
+export interface HistoryTurn {
+    userText: string;
+    assistantText: string;
+    toolCalls: HistoryToolCall[];
+}
+
 export interface ParsedMessages {
     systemPrompt: string;
     userText: string;
-    turns: Array<{ userText: string; assistantText: string }>;
+    turns: HistoryTurn[];
     toolResults: ToolResultInfo[];
 }
 

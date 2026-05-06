@@ -20,12 +20,18 @@ const DEFAULT_MAX_TOKENS = 64_000;
 
 // --- Hardcoded fallback models ---
 
+// Fallback only — used when GetUsableModels can't reach Cursor's API.
+// Real model list comes from dynamic discovery in getCursorModels().
 const FALLBACK_MODELS: CursorModel[] = [
+    { id: 'auto', name: 'Auto', reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
     { id: 'composer-2', name: 'Composer 2', reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+    { id: 'claude-4.5-sonnet', name: 'Claude 4.5 Sonnet', reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
     { id: 'claude-4-sonnet', name: 'Claude 4 Sonnet', reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-    { id: 'claude-3.5-sonnet', name: 'Claude 3.5 Sonnet', reasoning: false, contextWindow: 200_000, maxTokens: 8_192 },
-    { id: 'gpt-4o', name: 'GPT-4o', reasoning: false, contextWindow: 128_000, maxTokens: 16_384 },
-    { id: 'cursor-small', name: 'Cursor Small', reasoning: false, contextWindow: 200_000, maxTokens: 64_000 },
+    { id: 'claude-4-sonnet-thinking', name: 'Claude 4 Sonnet (Thinking)', reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+    { id: 'claude-4-opus', name: 'Claude 4 Opus', reasoning: true, contextWindow: 200_000, maxTokens: 32_000 },
+    { id: 'gpt-5', name: 'GPT-5', reasoning: true, contextWindow: 256_000, maxTokens: 64_000 },
+    { id: 'gpt-5-codex', name: 'GPT-5 Codex', reasoning: true, contextWindow: 256_000, maxTokens: 64_000 },
+    { id: 'gpt-4.1', name: 'GPT-4.1', reasoning: false, contextWindow: 1_000_000, maxTokens: 32_000 },
     { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
 ];
 

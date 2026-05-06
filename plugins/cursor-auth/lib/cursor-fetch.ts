@@ -42,12 +42,16 @@ import {
     KvClientMessageSchema,
     LsRejectedSchema,
     LsResultSchema,
+    McpArgsSchema,
     McpErrorSchema,
     McpResultSchema,
     McpSuccessSchema,
     McpTextContentSchema,
+    McpToolCallSchema,
     McpToolDefinitionSchema,
+    McpToolErrorSchema,
     McpToolResultContentItemSchema,
+    McpToolResultSchema,
     ModelDetailsSchema,
     ReadRejectedSchema,
     SelectedContextSchema,
@@ -60,6 +64,7 @@ import {
     SetBlobResultSchema,
     ShellRejectedSchema,
     ShellResultSchema,
+    ToolCallSchema,
     UserMessageActionSchema,
     UserMessageSchema,
     WriteRejectedSchema,
@@ -73,6 +78,8 @@ import {
 } from '../proto/agent_pb';
 import type {
     ChatCompletionRequest,
+    HistoryToolCall,
+    HistoryTurn,
     OpenAIMessage,
     OpenAIToolDef,
     PendingExec,
@@ -101,9 +108,31 @@ interface ActiveSession {
     blobStore: Map<string, Uint8Array>;
     mcpTools: McpToolDefinition[];
     pendingExecs: PendingExec[];
+    /** Last time this session was created or refreshed. */
+    lastActiveAt: number;
 }
 
 const activeSessions = new Map<string, ActiveSession>();
+let sessionGcTimer: NodeJS.Timeout | undefined;
+
+/** Idle bridge timeout: if a tool result hasn't arrived in this window the bridge is GC'd. */
+const SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
+function destroySession(session: ActiveSession): void {
+    clearInterval(session.heartbeatTimer);
+    try { session.h2Stream.close(); } catch {}
+    try { session.h2Client.close(); } catch {}
+}
+
+function gcStaleSessions(): void {
+    const now = Date.now();
+    for (const [key, session] of activeSessions) {
+        if (now - session.lastActiveAt > SESSION_IDLE_TIMEOUT_MS) {
+            destroySession(session);
+            activeSessions.delete(key);
+        }
+    }
+}
 
 export interface Logger {
     info(message: string, ...args: unknown[]): void;
@@ -163,6 +192,10 @@ export function startProxy(getAccessToken: () => Promise<string>, logger: Logger
             if (typeof addr === 'object' && addr) {
                 proxyPort = addr.port;
                 proxyServer = server;
+                if (!sessionGcTimer) {
+                    sessionGcTimer = setInterval(gcStaleSessions, 60_000);
+                    sessionGcTimer.unref?.();
+                }
                 logger.info(`Cursor proxy started on port ${proxyPort}`);
                 resolve(addr.port);
             } else {
@@ -180,10 +213,12 @@ export function stopProxy(): void {
         proxyServer = undefined;
         proxyPort = undefined;
     }
+    if (sessionGcTimer) {
+        clearInterval(sessionGcTimer);
+        sessionGcTimer = undefined;
+    }
     for (const [key, session] of activeSessions) {
-        clearInterval(session.heartbeatTimer);
-        try { session.h2Stream.close(); } catch {}
-        try { session.h2Client.close(); } catch {}
+        destroySession(session);
         activeSessions.delete(key);
     }
 }
@@ -254,18 +289,25 @@ function handleChatCompletion(
     }
 
     if (activeSession) {
-        clearInterval(activeSession.heartbeatTimer);
-        try { activeSession.h2Stream.close(); } catch {}
-        try { activeSession.h2Client.close(); } catch {}
+        destroySession(activeSession);
         activeSessions.delete(sessionKey);
     }
 
+    // Bridge died but caller is sending tool results: rebuild the conversation
+    // from history (turns now carry tool_call results) and synthesize a
+    // continuation prompt so Cursor sees a non-empty UserMessageAction.
+    let effectiveUserText = userText;
+    if (!effectiveUserText && toolResults.length > 0) {
+        effectiveUserText = 'Please continue based on the tool results above.';
+        logger.warn('Cursor proxy: rebuilding conversation after bridge expiry; using synthetic continuation prompt');
+    }
+
     const mcpTools = buildMcpToolDefinitions(tools);
-    const payload = buildCursorRequest(modelId, systemPrompt, userText, images, turns);
+    const payload = buildCursorRequest(modelId, systemPrompt, effectiveUserText, images, turns);
     payload.mcpTools = mcpTools;
 
     if (body.stream === false) {
-        handleNonStreaming(payload, accessToken, modelId, res);
+        handleNonStreaming(payload, accessToken, modelId, res, logger);
     } else {
         handleStreaming(payload, accessToken, modelId, sessionKey, res);
     }
@@ -348,13 +390,22 @@ interface ParsedMessages {
     systemPrompt: string;
     userText: string;
     images: ImageData[];
-    turns: Array<{ userText: string; assistantText: string }>;
+    turns: HistoryTurn[];
     toolResults: ToolResultInfo[];
 }
 
+/**
+ * Walk the OpenAI message list and reconstruct full conversation turns,
+ * preserving assistant tool_calls and their paired tool results.
+ *
+ * The trailing tool messages (those that arrive after the last assistant
+ * with no follow-up user) are also surfaced separately in `toolResults` so
+ * the caller can either resume an active bridge OR rebuild the conversation
+ * from scratch when the bridge has died.
+ */
 function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     let systemPrompt = 'You are a helpful assistant.';
-    const pairs: Array<{ userText: string; assistantText: string }> = [];
+    const turns: HistoryTurn[] = [];
     const toolResults: ToolResultInfo[] = [];
     let images: ImageData[] = [];
 
@@ -362,27 +413,90 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     if (systemParts.length > 0) systemPrompt = systemParts.join('\n');
 
     const nonSystem = messages.filter((m) => m.role !== 'system');
-    let pendingUser = '';
+
+    let current: HistoryTurn | null = null;
+    const flush = () => {
+        if (current && (current.userText || current.assistantText || current.toolCalls.length > 0)) {
+            turns.push(current);
+        }
+        current = null;
+    };
+
+    const findToolCall = (id: string): HistoryToolCall | undefined => {
+        if (!id) return undefined;
+        if (current) {
+            const hit = current.toolCalls.find((c) => c.toolCallId === id);
+            if (hit) return hit;
+        }
+        for (let i = turns.length - 1; i >= 0; i--) {
+            const hit = turns[i].toolCalls.find((c) => c.toolCallId === id);
+            if (hit) return hit;
+        }
+        return undefined;
+    };
 
     for (const msg of nonSystem) {
-        if (msg.role === 'tool') {
-            toolResults.push({ toolCallId: msg.tool_call_id ?? '', content: extractContent(msg.content).text });
-        } else if (msg.role === 'user') {
-            if (pendingUser) pairs.push({ userText: pendingUser, assistantText: '' });
+        if (msg.role === 'user') {
+            flush();
             const parsed = extractContent(msg.content);
-            pendingUser = parsed.text;
-            // Collect images from the latest user message
+            current = { userText: parsed.text, assistantText: '', toolCalls: [] };
             images = parsed.images;
         } else if (msg.role === 'assistant') {
-            if (pendingUser) { pairs.push({ userText: pendingUser, assistantText: extractContent(msg.content).text }); pendingUser = ''; }
+            if (!current) current = { userText: '', assistantText: '', toolCalls: [] };
+            const text = extractContent(msg.content).text;
+            if (text) {
+                current.assistantText = current.assistantText
+                    ? `${current.assistantText}\n${text}`
+                    : text;
+            }
+            if (Array.isArray(msg.tool_calls)) {
+                for (const tc of msg.tool_calls) {
+                    if (!tc || tc.type !== 'function' || !tc.function) continue;
+                    current.toolCalls.push({
+                        toolCallId: tc.id || crypto.randomUUID(),
+                        toolName: tc.function.name,
+                        argsJson: typeof tc.function.arguments === 'string'
+                            ? tc.function.arguments
+                            : JSON.stringify(tc.function.arguments ?? {}),
+                    });
+                }
+            }
+        } else if (msg.role === 'tool') {
+            const id = msg.tool_call_id ?? '';
+            const resultText = extractContent(msg.content).text;
+            // Always surface in toolResults — caller decides whether to use it
+            // for an active bridge resume.
+            toolResults.push({ toolCallId: id, content: resultText });
+            // Also attach to the matching history toolCall so a fresh
+            // (bridge-dead) request includes the result in conversation history.
+            const target = findToolCall(id);
+            if (target) {
+                target.resultText = resultText;
+            }
         }
     }
 
+    // Decide what becomes the "live" user prompt.
     let lastUserText = '';
-    if (pendingUser) { lastUserText = pendingUser; }
-    else if (pairs.length > 0 && toolResults.length === 0) { const last = pairs.pop()!; lastUserText = last.userText; }
+    if (current) {
+        if (current.userText && current.toolCalls.length === 0 && !current.assistantText) {
+            // Pure new-user-prompt turn: it IS the live action.
+            lastUserText = current.userText;
+            current = null;
+        } else {
+            // Current turn already had assistant content — flush to history.
+            // The final user prompt is either the previous turn's user (cancel
+            // the pop) or, when only tool results remain, leave empty so the
+            // caller can route to bridge resume.
+            flush();
+            if (toolResults.length === 0 && turns.length > 0) {
+                const last = turns.pop()!;
+                lastUserText = last.userText;
+            }
+        }
+    }
 
-    return { systemPrompt, userText: lastUserText, images, turns: pairs, toolResults };
+    return { systemPrompt, userText: lastUserText, images, turns, toolResults };
 }
 
 // ============================================================================
@@ -413,7 +527,64 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
 // gRPC Request Building
 // ============================================================================
 
-function buildCursorRequest(modelId: string, systemPrompt: string, userText: string, images: ImageData[], turns: Array<{ userText: string; assistantText: string }>): CursorRequestPayload {
+/**
+ * Encode a JSON args object to Cursor's MCP args bytes map.
+ * Each top-level field is serialized as a protobuf Value.
+ */
+function encodeMcpArgsBytes(argsJson: string): Record<string, Uint8Array> {
+    let parsed: unknown;
+    try {
+        parsed = argsJson ? JSON.parse(argsJson) : {};
+    } catch {
+        return {};
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out: Record<string, Uint8Array> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        try {
+            out[key] = toBinary(ValueSchema, fromJson(ValueSchema, value as JsonValue));
+        } catch {
+            // Skip values we can't encode rather than failing the whole request.
+        }
+    }
+    return out;
+}
+
+function buildHistoryToolCallStep(tc: HistoryToolCall): Uint8Array {
+    const mcpArgs = create(McpArgsSchema, {
+        name: tc.toolName,
+        toolName: tc.toolName,
+        toolCallId: tc.toolCallId,
+        providerIdentifier: 'alma',
+        args: encodeMcpArgsBytes(tc.argsJson),
+    });
+    const result = tc.resultText !== undefined
+        ? (tc.isError
+            ? create(McpToolResultSchema, {
+                result: { case: 'error', value: create(McpToolErrorSchema, { error: tc.resultText }) },
+            })
+            : create(McpToolResultSchema, {
+                result: {
+                    case: 'success',
+                    value: create(McpSuccessSchema, {
+                        content: [
+                            create(McpToolResultContentItemSchema, {
+                                content: { case: 'text', value: create(McpTextContentSchema, { text: tc.resultText }) },
+                            }),
+                        ],
+                        isError: false,
+                    }),
+                },
+            }))
+        : undefined;
+    const mcpToolCall = create(McpToolCallSchema, { args: mcpArgs, result });
+    const toolCall = create(ToolCallSchema, { tool: { case: 'mcpToolCall', value: mcpToolCall } });
+    return toBinary(ConversationStepSchema, create(ConversationStepSchema, {
+        message: { case: 'toolCall', value: toolCall },
+    }));
+}
+
+function buildCursorRequest(modelId: string, systemPrompt: string, userText: string, images: ImageData[], turns: HistoryTurn[]): CursorRequestPayload {
     const blobStore = new Map<string, Uint8Array>();
     const turnBytes: Uint8Array[] = [];
 
@@ -424,6 +595,9 @@ function buildCursorRequest(modelId: string, systemPrompt: string, userText: str
             stepBytes.push(toBinary(ConversationStepSchema, create(ConversationStepSchema, {
                 message: { case: 'assistantMessage', value: create(AssistantMessageSchema, { text: turn.assistantText }) },
             })));
+        }
+        for (const tc of turn.toolCalls) {
+            stepBytes.push(buildHistoryToolCallStep(tc));
         }
         const agentTurn = create(AgentConversationTurnStructureSchema, { userMessage: toBinary(UserMessageSchema, userMsg), steps: stepBytes });
         turnBytes.push(toBinary(ConversationTurnStructureSchema, create(ConversationTurnStructureSchema, {
@@ -563,7 +737,8 @@ function sendExec(exec: ExecServerMessage, mc: string, v: unknown, sendFrame: (d
 
 function deriveSessionKey(modelId: string, messages: OpenAIMessage[]): string {
     const first = messages.find((m) => m.role === 'user')?.content ?? '';
-    return createHash('sha256').update(`${modelId}:${first.slice(0, 200)}`).digest('hex').slice(0, 16);
+    const text = extractContent(first as any).text;
+    return createHash('sha256').update(`${modelId}:${text.slice(0, 200)}`).digest('hex').slice(0, 16);
 }
 
 // ============================================================================
@@ -627,7 +802,7 @@ function buildStreamProcessor(
                         state.pendingExecs.push(exec); onMcpFlag();
                         if (state.thinkingActive) { sse(chunk({ content: '</think>' })); state.thinkingActive = false; }
                         sse(chunk({ tool_calls: [{ index: state.toolCallIndex++, id: exec.toolCallId, type: 'function', function: { name: exec.toolName, arguments: exec.decodedArgs } }] }));
-                        activeSessions.set(sessionKey, { h2Client, h2Stream, heartbeatTimer, blobStore: payload.blobStore, mcpTools: payload.mcpTools, pendingExecs: state.pendingExecs });
+                        activeSessions.set(sessionKey, { h2Client, h2Stream, heartbeatTimer, blobStore: payload.blobStore, mcpTools: payload.mcpTools, pendingExecs: state.pendingExecs, lastActiveAt: Date.now() });
                         sse(chunk({}, 'tool_calls')); done(); end();
                     });
             } catch { /* skip */ }
@@ -680,7 +855,7 @@ function resumeWithToolResults(session: ActiveSession, toolResults: ToolResultIn
 // Non-Streaming
 // ============================================================================
 
-function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, modelId: string, res: http.ServerResponse): void {
+function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, modelId: string, res: http.ServerResponse, logger: Logger): void {
     const id = `chatcmpl-${crypto.randomUUID().replace(/-/g, '').slice(0, 28)}`;
     const created = Math.floor(Date.now() / 1000);
 
@@ -691,7 +866,38 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
 
     let fullText = '';
     let pendingBuffer = Buffer.alloc(0);
+    const collectedToolCalls: Array<{ id: string; name: string; argsJson: string }> = [];
+    let responded = false;
     const state: StreamState = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
+
+    const cleanup = () => {
+        clearInterval(heartbeatTimer);
+        try { h2Stream.close(); } catch {}
+        try { h2Client.close(); } catch {}
+    };
+
+    const respond = (finishReason: 'stop' | 'tool_calls' | 'error', errMessage?: string) => {
+        if (responded) return;
+        responded = true;
+        cleanup();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        const message: Record<string, unknown> = { role: 'assistant', content: fullText || null };
+        if (collectedToolCalls.length > 0) {
+            message.tool_calls = collectedToolCalls.map((tc, i) => ({
+                id: tc.id,
+                type: 'function',
+                function: { name: tc.name, arguments: tc.argsJson },
+            }));
+        }
+        if (errMessage) {
+            message.content = (message.content || '') + `\n[Error: ${errMessage}]`;
+        }
+        res.end(JSON.stringify({
+            id, object: 'chat.completion', created, model: modelId,
+            choices: [{ index: 0, message, finish_reason: finishReason }],
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        }));
+    };
 
     h2Stream.on('data', (incoming: Buffer) => {
         pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
@@ -702,20 +908,39 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
             const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
             pendingBuffer = pendingBuffer.subarray(5 + msgLen);
             if (flags & CONNECT_END_STREAM_FLAG) continue;
-            try { processServerMessage(fromBinary(AgentServerMessageSchema, messageBytes), payload.blobStore, payload.mcpTools, (data) => { if (!h2Stream.closed && !h2Stream.destroyed) h2Stream.write(data); }, state, (text) => { fullText += text; }, () => {}); }
-            catch { /* skip */ }
+            try {
+                processServerMessage(
+                    fromBinary(AgentServerMessageSchema, messageBytes),
+                    payload.blobStore, payload.mcpTools,
+                    (data) => { if (!h2Stream.closed && !h2Stream.destroyed) h2Stream.write(data); },
+                    state,
+                    (text) => { fullText += text; },
+                    (exec) => {
+                        // In non-streaming mode we cannot keep the bridge alive
+                        // because there is no SSE to pause. Collect tool calls
+                        // and finish with finish_reason=tool_calls; the caller
+                        // is responsible for invoking the tool and replaying
+                        // the conversation with results.
+                        collectedToolCalls.push({
+                            id: exec.toolCallId,
+                            name: exec.toolName,
+                            argsJson: exec.decodedArgs,
+                        });
+                    },
+                );
+            } catch (err) {
+                logger.warn('Cursor proxy non-stream parse error:', err);
+            }
         }
     });
 
     h2Stream.on('end', () => {
-        clearInterval(heartbeatTimer); h2Client.close();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ id, object: 'chat.completion', created, model: modelId, choices: [{ index: 0, message: { role: 'assistant', content: fullText }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }));
+        if (collectedToolCalls.length > 0) respond('tool_calls');
+        else respond('stop');
     });
 
-    h2Stream.on('error', () => {
-        clearInterval(heartbeatTimer); try { h2Client.close(); } catch {}
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ id, object: 'chat.completion', created, model: modelId, choices: [{ index: 0, message: { role: 'assistant', content: fullText }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }));
+    h2Stream.on('error', (err) => {
+        logger.error('Cursor proxy non-stream h2 error:', err);
+        respond('error', err instanceof Error ? err.message : String(err));
     });
 }

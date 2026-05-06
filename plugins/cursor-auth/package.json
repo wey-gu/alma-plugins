@@ -1,6 +1,6 @@
 {
     "name": "@alma/cursor-auth",
-    "version": "1.6.1",
+    "version": "1.7.0",
     "type": "module",
     "description": "Cursor OAuth plugin for Alma with custom fetch gRPC translation",
     "author": {
@@ -13,5 +13,9 @@
     },
     "dependencies": {
         "@bufbuild/protobuf": "^2.0.0"
+    },
+    "devDependencies": {
+        "@types/node": "^25.6.0",
+        "typescript": "^6.0.3"
     }
 }
