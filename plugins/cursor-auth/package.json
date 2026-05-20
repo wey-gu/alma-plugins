@@ -1,6 +1,6 @@
 {
     "name": "@alma/cursor-auth",
-    "version": "1.7.0",
+    "version": "1.7.1",
     "type": "module",
     "description": "Cursor OAuth plugin for Alma with custom fetch gRPC translation",
     "author": {

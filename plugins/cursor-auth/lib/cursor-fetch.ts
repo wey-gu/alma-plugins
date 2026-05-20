@@ -302,8 +302,30 @@ function handleChatCompletion(
         logger.warn('Cursor proxy: rebuilding conversation after bridge expiry; using synthetic continuation prompt');
     }
 
+    // Cursor's server interprets AgentConversationTurnStructure.user_message as a
+    // blob reference (not inline data). For fresh conversations the proxy has no
+    // such blobs stored, so passing reconstructed turns triggers "Blob not found".
+    // Match opencode-cursor: keep ConversationStateStructure.turns empty and inline
+    // prior turns into the live UserMessage text so the model still sees history.
+    if (turns.length > 0) {
+        const historyLines: string[] = [];
+        for (const turn of turns) {
+            if (turn.userText) historyLines.push(`User: ${turn.userText}`);
+            if (turn.assistantText) historyLines.push(`Assistant: ${turn.assistantText}`);
+            for (const tc of turn.toolCalls) {
+                historyLines.push(`Assistant tool_call: ${tc.toolName}(${tc.argsJson})`);
+                if (tc.resultText !== undefined) {
+                    historyLines.push(`Tool result: ${tc.resultText}`);
+                }
+            }
+        }
+        if (historyLines.length > 0) {
+            effectiveUserText = `[Previous conversation]\n${historyLines.join('\n')}\n\n[Current message]\n${effectiveUserText}`;
+        }
+    }
+
     const mcpTools = buildMcpToolDefinitions(tools);
-    const payload = buildCursorRequest(modelId, systemPrompt, effectiveUserText, images, turns);
+    const payload = buildCursorRequest(modelId, systemPrompt, effectiveUserText, images);
     payload.mcpTools = mcpTools;
 
     if (body.stream === false) {
@@ -584,34 +606,20 @@ function buildHistoryToolCallStep(tc: HistoryToolCall): Uint8Array {
     }));
 }
 
-function buildCursorRequest(modelId: string, systemPrompt: string, userText: string, images: ImageData[], turns: HistoryTurn[]): CursorRequestPayload {
+function buildCursorRequest(modelId: string, systemPrompt: string, userText: string, images: ImageData[]): CursorRequestPayload {
     const blobStore = new Map<string, Uint8Array>();
-    const turnBytes: Uint8Array[] = [];
-
-    for (const turn of turns) {
-        const userMsg = create(UserMessageSchema, { text: turn.userText, messageId: crypto.randomUUID() });
-        const stepBytes: Uint8Array[] = [];
-        if (turn.assistantText) {
-            stepBytes.push(toBinary(ConversationStepSchema, create(ConversationStepSchema, {
-                message: { case: 'assistantMessage', value: create(AssistantMessageSchema, { text: turn.assistantText }) },
-            })));
-        }
-        for (const tc of turn.toolCalls) {
-            stepBytes.push(buildHistoryToolCallStep(tc));
-        }
-        const agentTurn = create(AgentConversationTurnStructureSchema, { userMessage: toBinary(UserMessageSchema, userMsg), steps: stepBytes });
-        turnBytes.push(toBinary(ConversationTurnStructureSchema, create(ConversationTurnStructureSchema, {
-            turn: { case: 'agentConversationTurn', value: agentTurn },
-        })));
-    }
 
     const systemJson = JSON.stringify({ role: 'system', content: systemPrompt });
     const systemBytes = new TextEncoder().encode(systemJson);
     const systemBlobId = new Uint8Array(createHash('sha256').update(systemBytes).digest());
     blobStore.set(Buffer.from(systemBlobId).toString('hex'), systemBytes);
 
+    // Cursor interprets turns[].agentConversationTurn.user_message as a blob ID,
+    // not inline data. We have no such blobs for reconstructed history, so we
+    // always send an empty turns list and rely on the caller to inline history
+    // into the live UserMessage text instead.
     const conversationState = create(ConversationStateStructureSchema, {
-        rootPromptMessagesJson: [systemBlobId], turns: turnBytes,
+        rootPromptMessagesJson: [systemBlobId], turns: [],
         todos: [], pendingToolCalls: [], previousWorkspaceUris: [],
         fileStates: {}, fileStatesV2: {}, summaryArchives: [], turnTimings: [],
         subagentStates: {}, selfSummaryCount: 0, readPaths: [],
@@ -629,6 +637,12 @@ function buildCursorRequest(modelId: string, systemPrompt: string, userText: str
         );
         userMessage.selectedContext = create(SelectedContextSchema, { selectedImages });
     }
+    // Defensive: Cursor server may issue getBlob for the live user message bytes
+    // (it eventually folds them into the persisted conversation state). Pre-store
+    // the user message keyed by its raw bytes so a getBlob never misses.
+    const userMsgBytes = toBinary(UserMessageSchema, userMessage);
+    blobStore.set(Buffer.from(userMsgBytes).toString('hex'), userMsgBytes);
+
     const action = create(ConversationActionSchema, { action: { case: 'userMessageAction', value: create(UserMessageActionSchema, { userMessage }) } });
     const modelDetails = create(ModelDetailsSchema, { modelId, displayModelId: modelId, displayName: modelId });
     const runRequest = create(AgentRunRequestSchema, { conversationState, action, modelDetails, conversationId: crypto.randomUUID() });
