@@ -311,6 +311,33 @@ export class TokenStore {
         }
     }
 
+    /**
+     * Force-refresh tokens regardless of local expiry.
+     * Needed when the server invalidates an access token before it expires
+     * (e.g. "Your authentication token has been invalidated" after the same
+     * ChatGPT account logs in elsewhere and rotates the session).
+     * Concurrent callers share the same in-flight refresh.
+     */
+    async forceRefreshAccessToken(accountId?: string): Promise<string> {
+        const id = accountId ?? this.activeAccountId;
+        if (!id) {
+            throw new Error('Not authenticated. Please login first.');
+        }
+
+        let pending = this.refreshPromises.get(id);
+        if (!pending) {
+            pending = this.doRefresh(id);
+            this.refreshPromises.set(id, pending);
+        }
+
+        try {
+            const tokens = await pending;
+            return tokens.access_token;
+        } finally {
+            this.refreshPromises.delete(id);
+        }
+    }
+
     private async doRefresh(accountId: string): Promise<CodexTokens> {
         const record = this.accounts.get(accountId);
         if (!record?.tokens.refresh_token) {

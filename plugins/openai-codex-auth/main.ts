@@ -459,11 +459,34 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             }
 
             // Step 6: Make the request
-            const response = await globalThis.fetch(codexUrl, {
+            let response = await globalThis.fetch(codexUrl, {
                 ...init,
                 body,
                 headers,
             });
+
+            // Step 6.5: The server can invalidate an access token before its local
+            // expiry (e.g. "Your authentication token has been invalidated" after
+            // the same ChatGPT account logs in elsewhere). On 401, force a token
+            // refresh and retry the request once.
+            if (response.status === 401) {
+                const errText = await response
+                    .clone()
+                    .text()
+                    .catch(() => '');
+                logger.warn(`Codex API 401, forcing token refresh and retrying once: ${errText.slice(0, 200)}`);
+                try {
+                    const newToken = await tokenStore.forceRefreshAccessToken();
+                    headers.set('Authorization', `Bearer ${newToken}`);
+                    response = await globalThis.fetch(codexUrl, {
+                        ...init,
+                        body,
+                        headers,
+                    });
+                } catch (refreshErr) {
+                    logger.error('Forced token refresh failed:', refreshErr);
+                }
+            }
 
             // Step 7: Handle error response (matching opencode's handleErrorResponse)
             if (!response.ok) {
