@@ -213,6 +213,7 @@ export class NowledgeMemClient {
 			const result = spawnSync(candidate.cmd, [...candidate.prefix, "--version"], {
 				encoding: "utf-8",
 				timeout: 10_000,
+				windowsHide: true,
 			});
 			if (result.status === 0) {
 				this.command = candidate;
@@ -220,7 +221,7 @@ export class NowledgeMemClient {
 				return candidate;
 			}
 		}
-		throw new Error("nmem CLI not found. Install with `pip install nmem` or use `uvx --from nmem-cli nmem`.");
+		throw new Error("nmem CLI not found. Install with `pip install nmem-cli` or use `uvx --from nmem-cli nmem`.");
 	}
 
 	// --- Memory operations ---
