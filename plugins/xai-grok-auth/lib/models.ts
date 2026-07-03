@@ -3,6 +3,10 @@
  *
  * A static fallback list keeps the provider usable offline; fetchModels()
  * pulls the live catalog from api.x.ai and caches it here for the session.
+ *
+ * Note xAI splits its catalog across endpoints: /v1/language-models lists
+ * only text-output chat models, while image generation models live on
+ * /v1/image-generation-models (verified live with a SuperGrok OAuth token).
  */
 
 export interface XaiModel {
@@ -10,12 +14,14 @@ export interface XaiModel {
     name: string;
     description?: string;
     contextWindow: number;
-    maxOutputTokens: number;
+    maxOutputTokens?: number;
     reasoning: boolean;
     vision: boolean;
+    /** Dedicated image generation model (served by /v1/images/generations) */
+    imageOutput: boolean;
 }
 
-// Fallback catalog (context/output limits from models.dev, July 2026).
+// Fallback catalog (context/output limits from models.dev + live API, July 2026).
 const FALLBACK_MODELS: XaiModel[] = [
     {
         id: 'grok-4.3',
@@ -25,6 +31,7 @@ const FALLBACK_MODELS: XaiModel[] = [
         maxOutputTokens: 30_000,
         reasoning: true,
         vision: true,
+        imageOutput: false,
     },
     {
         id: 'grok-4.20-0309-reasoning',
@@ -33,6 +40,7 @@ const FALLBACK_MODELS: XaiModel[] = [
         maxOutputTokens: 30_000,
         reasoning: true,
         vision: true,
+        imageOutput: false,
     },
     {
         id: 'grok-4.20-0309-non-reasoning',
@@ -41,6 +49,7 @@ const FALLBACK_MODELS: XaiModel[] = [
         maxOutputTokens: 30_000,
         reasoning: false,
         vision: true,
+        imageOutput: false,
     },
     {
         id: 'grok-build-0.1',
@@ -50,6 +59,25 @@ const FALLBACK_MODELS: XaiModel[] = [
         maxOutputTokens: 256_000,
         reasoning: true,
         vision: true,
+        imageOutput: false,
+    },
+    {
+        id: 'grok-imagine-image',
+        name: 'Grok Imagine (Image)',
+        description: 'Image generation and image-to-image editing',
+        contextWindow: 8_000,
+        reasoning: false,
+        vision: true,
+        imageOutput: true,
+    },
+    {
+        id: 'grok-imagine-image-quality',
+        name: 'Grok Imagine (Image, Quality)',
+        description: 'Higher-quality image generation and editing',
+        contextWindow: 8_000,
+        reasoning: false,
+        vision: true,
+        imageOutput: true,
     },
 ];
 
@@ -69,9 +97,13 @@ export function setCachedModels(models: XaiModel[]): void {
 // Live catalog parsing
 // ============================================================================
 
-/** Media/embedding models can't back a chat provider — drop them. */
-function isChatModelId(id: string): boolean {
-    return !/imagine|image|video|embed|tts|whisper/i.test(id);
+/**
+ * Models we can't drive from a chat provider at all: video generation,
+ * embeddings, speech. Image generation IS supported (routed to
+ * /v1/images/generations by Alma), so imagine-image stays.
+ */
+function isSupportedModelId(id: string): boolean {
+    return !/video|embed|tts|whisper/i.test(id);
 }
 
 function titleCase(id: string): string {
@@ -92,9 +124,11 @@ function readNumber(obj: Record<string, unknown>, keys: string[]): number | unde
 }
 
 /**
- * Build models from GET /v1/language-models (rich metadata) or
- * GET /v1/models (bare OpenAI-style list). Field names are read defensively
- * since xAI has evolved this schema over time.
+ * Build models from xAI catalog endpoints:
+ * - GET /v1/language-models        (rich metadata, text models)
+ * - GET /v1/image-generation-models (rich metadata, image models)
+ * - GET /v1/models                 (bare OpenAI-style list, mixed)
+ * Field names are read defensively since xAI has evolved this schema.
  */
 export function buildModelsFromApiResponse(data: unknown): XaiModel[] {
     const root = data as { models?: unknown[]; data?: unknown[] } | null;
@@ -105,21 +139,29 @@ export function buildModelsFromApiResponse(data: unknown): XaiModel[] {
         if (!raw || typeof raw !== 'object') continue;
         const entry = raw as Record<string, unknown>;
         const id = typeof entry.id === 'string' ? entry.id : undefined;
-        if (!id || !isChatModelId(id)) continue;
+        if (!id || !isSupportedModelId(id)) continue;
 
         const inputModalities = Array.isArray(entry.input_modalities) ? (entry.input_modalities as unknown[]) : null;
         const outputModalities = Array.isArray(entry.output_modalities) ? (entry.output_modalities as unknown[]) : null;
-        // When modality metadata exists, require text-in/text-out.
-        if (inputModalities && !inputModalities.includes('text')) continue;
-        if (outputModalities && !outputModalities.includes('text')) continue;
+
+        // Image output: from modality metadata when present, name heuristic
+        // for the bare /v1/models list.
+        const imageOutput = outputModalities ? outputModalities.includes('image') : /imagine-image/i.test(id);
+
+        // Text-capable check only applies to non-image models.
+        if (!imageOutput) {
+            if (inputModalities && !inputModalities.includes('text')) continue;
+            if (outputModalities && !outputModalities.includes('text')) continue;
+        }
 
         models.push({
             id,
             name: titleCase(id),
-            contextWindow: readNumber(entry, ['context_window', 'max_prompt_length', 'context_length']) ?? 256_000,
-            maxOutputTokens: readNumber(entry, ['max_output_tokens', 'max_completion_tokens']) ?? 30_000,
-            reasoning: !/non-reasoning/i.test(id),
+            contextWindow: readNumber(entry, ['context_window', 'max_prompt_length', 'context_length']) ?? (imageOutput ? 8_000 : 256_000),
+            maxOutputTokens: imageOutput ? undefined : (readNumber(entry, ['max_output_tokens', 'max_completion_tokens']) ?? 30_000),
+            reasoning: !imageOutput && !/non-reasoning/i.test(id),
             vision: inputModalities ? inputModalities.includes('image') : true,
+            imageOutput,
         });
     }
     return models;

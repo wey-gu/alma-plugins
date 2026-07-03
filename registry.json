@@ -124,8 +124,8 @@
         {
             "id": "xai-grok-auth",
             "name": "xAI Grok Auth",
-            "version": "1.1.0",
-            "description": "Use SuperGrok subscription with Alma via xAI OAuth. Shows account email, avatar, and rate-limit quota in settings.",
+            "version": "1.2.0",
+            "description": "Use SuperGrok subscription with Alma via xAI OAuth. Chat, image generation/editing (grok-imagine), account email/avatar and quota in settings.",
             "author": {
                 "name": "Alma Community"
             },

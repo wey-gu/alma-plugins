@@ -133,34 +133,46 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         contextWindow: model.contextWindow,
         maxOutputTokens: model.maxOutputTokens,
         capabilities: {
-            streaming: true,
+            streaming: !model.imageOutput,
             reasoning: model.reasoning,
-            functionCalling: true,
+            functionCalling: !model.imageOutput,
             vision: model.vision,
+            imageOutput: model.imageOutput,
         },
     });
 
-    /** Fetch the live model catalog. Tries the metadata-rich endpoint first. */
+    /**
+     * Fetch the live model catalog. xAI splits it across endpoints: chat
+     * models on /language-models, image generation models on
+     * /image-generation-models (hidden from /language-models even when the
+     * token can call them). The bare /models list is the last resort.
+     */
     const fetchLiveModels = async (): Promise<XaiModel[]> => {
         const accessToken = await tokenStore.getValidAccessToken();
         const headers = { Authorization: `Bearer ${accessToken}` };
 
-        for (const endpoint of ['/language-models', '/models']) {
+        const fetchCatalog = async (endpoint: string): Promise<XaiModel[]> => {
             try {
                 const response = await globalThis.fetch(`${XAI_BASE_URL}${endpoint}`, { headers });
                 if (!response.ok) {
                     logger.warn(`xAI ${endpoint} returned ${response.status}`);
-                    continue;
+                    return [];
                 }
-                const models = buildModelsFromApiResponse(await response.json());
-                if (models.length > 0) {
-                    return models;
-                }
+                return buildModelsFromApiResponse(await response.json());
             } catch (error) {
                 logger.warn(`xAI ${endpoint} fetch failed:`, error);
+                return [];
             }
-        }
-        return [];
+        };
+
+        const [chatModels, imageModels] = await Promise.all([
+            fetchCatalog('/language-models'),
+            fetchCatalog('/image-generation-models'),
+        ]);
+        const merged = [...chatModels, ...imageModels];
+        if (merged.length > 0) return merged;
+
+        return fetchCatalog('/models');
     };
 
     // =========================================================================
