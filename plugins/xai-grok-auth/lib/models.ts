@@ -81,10 +81,37 @@ const FALLBACK_MODELS: XaiModel[] = [
     },
 ];
 
+// Callable via SuperGrok OAuth on api.x.ai but deliberately omitted from
+// models.dev, /v1/models AND /v1/language-models (verified live 2026-07-03;
+// discovery credit: hermes-agent PR #47908). Merged into every catalog since
+// no live fetch will ever return them.
+const CURATED_EXTRAS: XaiModel[] = [
+    {
+        id: 'grok-composer-2.5-fast',
+        name: 'Grok Composer 2.5 Fast',
+        description: 'Grok Build CLI coding model (hidden from xAI catalogs; tuned for agent harnesses)',
+        contextWindow: 200_000,
+        reasoning: false,
+        vision: false,
+        imageOutput: false,
+    },
+];
+
+/** Append curated extras, slotting them right after grok-build when present. */
+function mergeCuratedExtras(models: XaiModel[]): XaiModel[] {
+    const out = [...models];
+    for (const extra of CURATED_EXTRAS) {
+        if (out.some(m => m.id === extra.id)) continue;
+        const buildIdx = out.findIndex(m => m.id.startsWith('grok-build'));
+        out.splice(buildIdx >= 0 ? buildIdx + 1 : out.length, 0, extra);
+    }
+    return out;
+}
+
 let cachedModels: XaiModel[] | null = null;
 
 export function getActiveModels(): XaiModel[] {
-    return cachedModels ?? FALLBACK_MODELS;
+    return mergeCuratedExtras(cachedModels ?? FALLBACK_MODELS);
 }
 
 export function setCachedModels(models: XaiModel[]): void {

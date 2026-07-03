@@ -311,7 +311,9 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 }
                 setCachedModels(models);
                 logger.info(`Fetched and cached ${models.length} models from xAI API`);
-                return models.map(toProviderModel);
+                // getActiveModels merges curated extras (e.g. grok-composer-2.5-fast)
+                // that the live catalogs never return.
+                return getActiveModels().map(toProviderModel);
             } catch (error) {
                 logger.error('Error fetching xAI models:', error);
                 return this.getModels();
