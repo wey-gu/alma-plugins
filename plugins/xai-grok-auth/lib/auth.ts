@@ -182,8 +182,12 @@ function safeDecodeJWT(token: string | undefined): Record<string, unknown> | nul
  * The stored expires_at is best-effort (xAI does not always return
  * expires_in), so for JWT access tokens the `exp` claim is the load-bearing
  * check. Opaque tokens fall back to the stored deadline only.
+ *
+ * Skew is 1 hour (matching hermes-agent): SuperGrok access tokens live ~6h,
+ * and a narrow window leaves brief credential-expiry gaps for sessions that
+ * only touch the provider occasionally. Refreshing early keeps tokens warm.
  */
-export function isTokenExpiring(tokens: XaiTokens, skewMs: number = 2 * 60 * 1000): boolean {
+export function isTokenExpiring(tokens: XaiTokens, skewMs: number = 60 * 60 * 1000): boolean {
     const claims = safeDecodeJWT(tokens.access_token);
     if (claims && typeof claims.exp === 'number') {
         return claims.exp * 1000 <= Date.now() + skewMs;

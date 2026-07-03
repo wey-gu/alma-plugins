@@ -198,11 +198,22 @@ export class TokenStore {
         try {
             await this.refreshPromise;
         } catch (error) {
-            // A definitive 4xx from the token endpoint means the refresh token
-            // is dead (revoked / rotated elsewhere) — force re-login rather
-            // than looping on a broken pair.
             const message = error instanceof Error ? error.message : String(error);
-            if (/\((400|401|403)\)/.test(message)) {
+            // 403 from the token endpoint is a tier/entitlement gate: the OAuth
+            // grant is valid but the account isn't allowed xAI API access (xAI
+            // restricts API/OAuth use to specific SuperGrok tiers — see xAI
+            // issue #26847 / hermes-agent's xai_oauth_tier_denied). Re-login
+            // can't fix that, so keep the credentials instead of wiping them.
+            if (/\(403\)/.test(message)) {
+                this.logger.error('xAI refresh denied (403 tier gate), keeping credentials:', message);
+                throw new Error(
+                    'xAI OAuth: this account is not authorized for xAI API access (subscription tier restriction). Re-logging in will not help; upgrade the SuperGrok tier or use an API key provider.'
+                );
+            }
+            // A definitive 400/401 from the token endpoint means the refresh
+            // token is dead (revoked / rotated elsewhere) — force re-login
+            // rather than looping on a broken pair.
+            if (/\((400|401)\)/.test(message)) {
                 this.logger.error('xAI refresh token rejected, clearing credentials:', message);
                 await this.clearTokens();
             }
