@@ -1,7 +1,7 @@
 {
     "$schema": "./registry.schema.json",
     "version": "1.0.0",
-    "lastUpdated": "2026-04-23T09:00:00Z",
+    "lastUpdated": "2026-07-03T00:00:00Z",
     "plugins": [
         {
             "id": "hello-world",
@@ -117,6 +117,22 @@
             "tags": ["cursor", "oauth", "proxy", "grpc", "claude", "gpt", "gemini", "provider"],
             "repository": "https://github.com/yetone/alma-plugins",
             "path": "plugins/cursor-auth",
+            "downloads": 0,
+            "rating": 0,
+            "featured": true
+        },
+        {
+            "id": "xai-grok-auth",
+            "name": "xAI Grok Auth",
+            "version": "1.0.0",
+            "description": "Use SuperGrok subscription with Alma via xAI OAuth. Signs requests to api.x.ai with your Grok account tokens.",
+            "author": {
+                "name": "Alma Community"
+            },
+            "type": ["provider"],
+            "tags": ["xai", "grok", "supergrok", "oauth", "provider"],
+            "repository": "https://github.com/yetone/alma-plugins",
+            "path": "plugins/xai-grok-auth",
             "downloads": 0,
             "rating": 0,
             "featured": true

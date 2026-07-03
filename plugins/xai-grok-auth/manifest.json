@@ -1,0 +1,51 @@
+{
+    "id": "xai-grok-auth",
+    "name": "xAI Grok Auth",
+    "version": "1.0.0",
+    "description": "Use SuperGrok subscription with Alma via xAI OAuth. Signs requests to api.x.ai with your Grok account tokens.",
+    "author": {
+        "name": "Alma Community"
+    },
+    "main": "main.js",
+    "engines": {
+        "alma": "^0.1.0"
+    },
+    "type": "provider",
+    "permissions": [
+        "network:fetch",
+        "network:localhost",
+        "network:domain:auth.x.ai",
+        "network:domain:accounts.x.ai",
+        "network:domain:api.x.ai",
+        "providers:manage",
+        "notifications"
+    ],
+    "activationEvents": [
+        "onStartup"
+    ],
+    "contributes": {
+        "providers": [
+            {
+                "id": "xai-grok",
+                "name": "xAI Grok (SuperGrok)",
+                "authType": "oauth"
+            }
+        ],
+        "commands": [
+            {
+                "id": "xai-grok-auth.login",
+                "title": "Login to xAI (SuperGrok)"
+            },
+            {
+                "id": "xai-grok-auth.logout",
+                "title": "Logout from xAI"
+            }
+        ]
+    },
+    "keywords": [
+        "xai",
+        "grok",
+        "supergrok",
+        "oauth"
+    ]
+}
