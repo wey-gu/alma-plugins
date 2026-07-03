@@ -22,6 +22,14 @@ per-token billing needed.
   401-force-refresh-retry path for tokens invalidated server-side.
 - **Models**: static fallback list; the Fetch button pulls the live catalog
   from `/v1/language-models` (falling back to `/v1/models`).
+- **Account display**: email/name/avatar come from xAI's OIDC userinfo
+  endpoint (`auth.x.ai/oauth2/userinfo`), with JWT claims and Gravatar as
+  fallbacks.
+- **Quota**: xAI exposes no subscription-quota endpoint, so quota is captured
+  opportunistically from the rate-limit headers on api.x.ai responses
+  (OpenAI-style `x-ratelimit-*` and IETF `ratelimit-*` both understood).
+  Numbers appear in settings after the first chat request and update with
+  every call; the Refresh button also probes `/v1/models` for headers.
 
 ## Usage
 

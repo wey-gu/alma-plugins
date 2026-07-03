@@ -124,8 +124,8 @@
         {
             "id": "xai-grok-auth",
             "name": "xAI Grok Auth",
-            "version": "1.0.0",
-            "description": "Use SuperGrok subscription with Alma via xAI OAuth. Signs requests to api.x.ai with your Grok account tokens.",
+            "version": "1.1.0",
+            "description": "Use SuperGrok subscription with Alma via xAI OAuth. Shows account email, avatar, and rate-limit quota in settings.",
             "author": {
                 "name": "Alma Community"
             },

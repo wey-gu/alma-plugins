@@ -1,28 +1,32 @@
 /**
  * Token Store for xAI Grok Auth — single account.
  *
- * Stores the OAuth token pair in the plugin's secret storage and refreshes
- * the access token proactively. Concurrent refreshes are collapsed onto one
- * HTTP call (single-flight) so a rotating refresh_token is never replayed.
+ * Persists the OAuth token pair plus display data (profile, quota) in the
+ * plugin's secret storage and refreshes the access token proactively.
+ * Concurrent refreshes are collapsed onto one HTTP call (single-flight) so a
+ * rotating refresh_token is never replayed.
  *
  * Storage layout:
- *   - `xai_tokens`       → JSON<XaiTokens>
+ *   - `xai_account`     → JSON<XaiStoredRecord> ({ tokens, profile?, quota? })
+ *   - `xai_tokens`       (legacy) → JSON<XaiTokens> — migrated on load
  *   - `pending_verifier` → string (PKCE verifier, during login only)
  *   - `pending_state`    → string (OAuth state, during login only)
  */
 
-import type { XaiTokens, XaiAccountClaims, SecretStorage, Logger } from './types';
-import { refreshTokens, isTokenExpiring, extractAccountClaims } from './auth';
+import type { XaiTokens, XaiStoredRecord, XaiAccountProfile, XaiQuota, SecretStorage, Logger } from './types';
+import { refreshTokens, isTokenExpiring, decodeAccessTokenSub, extractAccountClaims } from './auth';
 
-const STORAGE_KEY = 'xai_tokens';
+const STORAGE_KEY = 'xai_account';
+const LEGACY_STORAGE_KEY = 'xai_tokens';
 const PENDING_VERIFIER_KEY = 'pending_verifier';
 const PENDING_STATE_KEY = 'pending_state';
 
 export class TokenStore {
     private secrets: SecretStorage;
     private logger: Logger;
-    private tokens: XaiTokens | null = null;
+    private record: XaiStoredRecord | null = null;
     private refreshPromise: Promise<XaiTokens> | null = null;
+    private lastPersistedQuota: string | null = null;
 
     constructor(secrets: SecretStorage, logger: Logger) {
         this.secrets = secrets;
@@ -33,34 +37,86 @@ export class TokenStore {
         try {
             const stored = await this.secrets.get(STORAGE_KEY);
             if (stored) {
-                const parsed = JSON.parse(stored) as XaiTokens;
-                if (parsed && parsed.access_token && parsed.refresh_token) {
-                    this.tokens = parsed;
-                    this.logger.info('Loaded cached xAI tokens');
+                const parsed = JSON.parse(stored) as XaiStoredRecord;
+                if (parsed?.tokens?.access_token && parsed.tokens.refresh_token) {
+                    this.record = parsed;
+                    this.logger.info('Loaded cached xAI account');
+                    return;
+                }
+            }
+
+            // Migrate the v1.0 layout (bare tokens under xai_tokens).
+            const legacy = await this.secrets.get(LEGACY_STORAGE_KEY);
+            if (legacy) {
+                const tokens = JSON.parse(legacy) as XaiTokens;
+                if (tokens?.access_token && tokens.refresh_token) {
+                    this.record = { tokens };
+                    await this.persist();
+                    await this.secrets.delete(LEGACY_STORAGE_KEY);
+                    this.logger.info('Migrated legacy xAI token storage');
                 }
             }
         } catch (error) {
-            this.logger.error('Failed to load cached xAI tokens:', error);
+            this.logger.error('Failed to load cached xAI account:', error);
         }
     }
 
     hasTokens(): boolean {
-        return this.tokens !== null;
+        return this.record !== null;
     }
 
-    getAccountClaims(): XaiAccountClaims | null {
-        return this.tokens ? extractAccountClaims(this.tokens) : null;
+    getProfile(): XaiAccountProfile | undefined {
+        return this.record?.profile;
+    }
+
+    getQuota(): XaiQuota | undefined {
+        return this.record?.quota;
+    }
+
+    /** Claims decoded from the stored JWTs — fallback when userinfo fails. */
+    getIdTokenClaims(): XaiAccountProfile | null {
+        return this.record ? extractAccountClaims(this.record.tokens) : null;
+    }
+
+    /** Stable account id for the UI: JWT `sub`, then email, then a constant. */
+    getAccountId(): string {
+        if (!this.record) return 'xai';
+        return decodeAccessTokenSub(this.record.tokens.access_token) ?? this.record.profile?.email ?? 'xai';
+    }
+
+    private async persist(): Promise<void> {
+        if (this.record) {
+            await this.secrets.set(STORAGE_KEY, JSON.stringify(this.record));
+        }
     }
 
     async saveTokens(tokens: XaiTokens): Promise<void> {
-        this.tokens = tokens;
-        await this.secrets.set(STORAGE_KEY, JSON.stringify(tokens));
+        this.record = { ...(this.record ?? {}), tokens };
+        await this.persist();
+    }
+
+    async setProfile(profile: XaiAccountProfile): Promise<void> {
+        if (!this.record) return;
+        this.record.profile = { ...this.record.profile, ...profile };
+        await this.persist();
+    }
+
+    /** Update quota; skips the disk write when nothing changed. */
+    async setQuota(quota: XaiQuota): Promise<void> {
+        if (!this.record) return;
+        this.record.quota = quota;
+        const fingerprint = JSON.stringify([quota.models, quota.rateLimitReached]);
+        if (fingerprint === this.lastPersistedQuota) return;
+        this.lastPersistedQuota = fingerprint;
+        await this.persist();
     }
 
     async clearTokens(): Promise<void> {
-        this.tokens = null;
+        this.record = null;
         this.refreshPromise = null;
+        this.lastPersistedQuota = null;
         await this.secrets.delete(STORAGE_KEY);
+        await this.secrets.delete(LEGACY_STORAGE_KEY);
         await this.clearPendingState();
     }
 
@@ -94,15 +150,15 @@ export class TokenStore {
      * expire.
      */
     async getValidAccessToken(): Promise<string> {
-        if (!this.tokens) {
+        if (!this.record) {
             throw new Error('Not authenticated with xAI. Please connect your SuperGrok account.');
         }
 
-        if (isTokenExpiring(this.tokens)) {
+        if (isTokenExpiring(this.record.tokens)) {
             await this.refresh();
         }
 
-        return this.tokens.access_token;
+        return this.record.tokens.access_token;
     }
 
     /**
@@ -110,23 +166,22 @@ export class TokenStore {
      * invalidates a token early (401 mid-flight).
      */
     async forceRefreshAccessToken(): Promise<string> {
-        if (!this.tokens) {
+        if (!this.record) {
             throw new Error('Not authenticated with xAI. Please connect your SuperGrok account.');
         }
         await this.refresh();
-        return this.tokens.access_token;
+        return this.record.tokens.access_token;
     }
 
     private async refresh(): Promise<void> {
         if (!this.refreshPromise) {
-            const current = this.tokens;
+            const current = this.record?.tokens;
             if (!current) {
                 throw new Error('Not authenticated with xAI.');
             }
             this.refreshPromise = refreshTokens(current.refresh_token)
                 .then(async refreshed => {
-                    // Preserve the id_token: refresh responses may omit it and
-                    // it is our only source of account email for display.
+                    // Preserve the id_token: refresh responses may omit it.
                     const merged: XaiTokens = {
                         ...refreshed,
                         id_token: refreshed.id_token ?? current.id_token,

@@ -7,7 +7,7 @@
  * so we reuse the Grok-CLI client_id that xAI ships for desktop OAuth flows.
  */
 
-import type { XaiTokens, XaiAccountClaims } from './types';
+import type { XaiTokens, XaiAccountProfile } from './types';
 
 // ============================================================================
 // OAuth Configuration
@@ -194,8 +194,9 @@ export function isTokenExpiring(tokens: XaiTokens, skewMs: number = 2 * 60 * 100
 /**
  * Extract account claims for display. The id_token (openid/profile/email
  * scopes) is the primary source; access_token fills gaps if it's a JWT.
+ * Used as fallback when the userinfo endpoint is unreachable.
  */
-export function extractAccountClaims(tokens: XaiTokens): XaiAccountClaims {
+export function extractAccountClaims(tokens: XaiTokens): XaiAccountProfile {
     const id = safeDecodeJWT(tokens.id_token) ?? {};
     const access = safeDecodeJWT(tokens.access_token) ?? {};
 
@@ -207,5 +208,13 @@ export function extractAccountClaims(tokens: XaiTokens): XaiAccountClaims {
     return {
         email: readString(id, 'email') ?? readString(access, 'email'),
         name: readString(id, 'name') ?? readString(access, 'name'),
+        picture: readString(id, 'picture') ?? readString(access, 'picture'),
     };
+}
+
+/** OIDC subject from the access token, used as a stable account id. */
+export function decodeAccessTokenSub(accessToken: string): string | undefined {
+    const claims = safeDecodeJWT(accessToken);
+    const sub = claims?.sub;
+    return typeof sub === 'string' && sub.length > 0 ? sub : undefined;
 }

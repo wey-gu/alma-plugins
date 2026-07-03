@@ -20,6 +20,8 @@ import {
     CORS_ORIGINS,
 } from './lib/auth';
 import { getActiveModels, setCachedModels, buildModelsFromApiResponse, type XaiModel } from './lib/models';
+import { fetchUserInfo, avatarUrlForEmail } from './lib/profile';
+import { quotaFromHeaders } from './lib/rate-limits';
 
 const XAI_BASE_URL = 'https://api.x.ai/v1';
 const DUMMY_API_KEY = 'xai-oauth';
@@ -31,6 +33,53 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
     const tokenStore = new TokenStore(storage.secrets, logger);
     await tokenStore.initialize();
+
+    // =========================================================================
+    // Profile (email / name / avatar) — best-effort, never throws
+    // =========================================================================
+
+    /**
+     * Resolve the account profile: OIDC userinfo first, JWT claims as
+     * fallback, Gravatar when neither carries a picture.
+     */
+    const refreshProfile = async (): Promise<void> => {
+        try {
+            if (!tokenStore.hasTokens()) return;
+            const accessToken = await tokenStore.getValidAccessToken();
+
+            const profile = (await fetchUserInfo(accessToken, logger)) ?? tokenStore.getIdTokenClaims() ?? {};
+            if (!profile.picture && profile.email) {
+                const gravatar = await avatarUrlForEmail(profile.email);
+                if (gravatar) profile.picture = gravatar;
+            }
+            if (profile.email || profile.name || profile.picture) {
+                await tokenStore.setProfile(profile);
+            }
+        } catch (error) {
+            logger.warn('[xai profile] refresh failed:', error);
+        }
+    };
+
+    // Warm the profile cache in the background for pre-existing logins so the
+    // settings page shows the email the first time it renders.
+    if (tokenStore.hasTokens() && !tokenStore.getProfile()?.email) {
+        void refreshProfile();
+    }
+
+    // =========================================================================
+    // Quota — captured opportunistically from api.x.ai rate-limit headers
+    // =========================================================================
+
+    const captureQuota = (response: Response): void => {
+        try {
+            const quota = quotaFromHeaders(response.headers, response.status);
+            if (quota) {
+                void tokenStore.setQuota(quota).catch(() => {});
+            }
+        } catch {
+            // Quota capture must never interfere with the request path.
+        }
+    };
 
     // =========================================================================
     // Custom Fetch Wrapper
@@ -68,6 +117,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 }
             }
 
+            captureQuota(response);
             return response;
         };
     };
@@ -123,9 +173,57 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         description: 'Access Grok models via your SuperGrok subscription',
         authType: 'oauth',
         sdkType: 'openai-compatible',
+        supportsMultiAccount: true,
 
         async isAuthenticated() {
             return tokenStore.hasTokens();
+        },
+
+        // =====================================================================
+        // Account listing (single account, surfaced for email/avatar/quota UI)
+        // =====================================================================
+
+        async getAccounts() {
+            if (!tokenStore.hasTokens()) return [];
+            const profile = tokenStore.getProfile() ?? tokenStore.getIdTokenClaims() ?? {};
+            const quota = tokenStore.getQuota();
+            return [
+                {
+                    id: tokenStore.getAccountId(),
+                    email: profile.email,
+                    label: profile.name ?? 'SuperGrok',
+                    avatarUrl: profile.picture,
+                    isRateLimited: quota?.rateLimitReached === true,
+                    quota: quota
+                        ? {
+                              models: quota.models,
+                              lastUpdated: quota.lastUpdated,
+                          }
+                        : undefined,
+                },
+            ];
+        },
+
+        async removeAccount() {
+            await tokenStore.clearTokens();
+            ui.showNotification('xAI account removed', { type: 'info' });
+        },
+
+        async refreshQuotas() {
+            await refreshProfile();
+            // xAI has no quota endpoint; probe a cheap authenticated endpoint
+            // and harvest whatever rate-limit headers it carries. Real quota
+            // updates arrive continuously from chat traffic via captureQuota.
+            try {
+                if (!tokenStore.hasTokens()) return;
+                const accessToken = await tokenStore.getValidAccessToken();
+                const response = await globalThis.fetch(`${XAI_BASE_URL}/models`, {
+                    headers: { Authorization: `Bearer ${accessToken}` },
+                });
+                captureQuota(response);
+            } catch (error) {
+                logger.warn('[xai quota] probe failed:', error);
+            }
         },
 
         async authenticate() {
@@ -163,8 +261,12 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 await tokenStore.saveTokens(tokens);
                 await tokenStore.clearPendingState();
 
-                const claims = tokenStore.getAccountClaims();
-                const label = claims?.email ? ` (${claims.email})` : '';
+                // Resolve email/avatar before announcing success so the
+                // settings page renders the account immediately.
+                await refreshProfile();
+
+                const email = tokenStore.getProfile()?.email;
+                const label = email ? ` (${email})` : '';
                 ui.showNotification(`Successfully connected to xAI${label}!`, { type: 'success' });
                 logger.info('xAI authentication successful');
 
@@ -228,8 +330,8 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
     const statusCommand = commands.register('status', async () => {
         if (tokenStore.hasTokens()) {
-            const claims = tokenStore.getAccountClaims();
-            ui.showNotification(`Connected to xAI${claims?.email ? ` (${claims.email})` : ''}`, { type: 'success' });
+            const email = tokenStore.getProfile()?.email;
+            ui.showNotification(`Connected to xAI${email ? ` (${email})` : ''}`, { type: 'success' });
         } else {
             ui.showNotification('Not connected to xAI', { type: 'warning' });
         }

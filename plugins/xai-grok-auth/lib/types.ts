@@ -10,9 +10,33 @@ export interface XaiTokens {
     id_token?: string;
 }
 
-export interface XaiAccountClaims {
+export interface XaiAccountProfile {
     email?: string;
     name?: string;
+    picture?: string;
+}
+
+/** Per-limit quota entry, shaped for Alma's ProviderAccountInfo.quota */
+export interface XaiQuotaModel {
+    /** Limit name (e.g. "requests", "tokens") */
+    name: string;
+    /** Remaining percentage (0-100) */
+    percentage: number;
+    /** Reset time in ISO 8601 format */
+    resetTime: string;
+}
+
+export interface XaiQuota {
+    models: XaiQuotaModel[];
+    lastUpdated: number;
+    rateLimitReached?: boolean;
+}
+
+/** Everything persisted for the (single) connected account. */
+export interface XaiStoredRecord {
+    tokens: XaiTokens;
+    profile?: XaiAccountProfile;
+    quota?: XaiQuota;
 }
 
 export interface SecretStorage {
