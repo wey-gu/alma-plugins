@@ -552,6 +552,34 @@ export const CODEX_MODELS: CodexModelInfo[] = [
 ];
 
 // ============================================================================
+// Image Generation Models
+// ============================================================================
+
+/**
+ * Dedicated image models served by the Codex subscription backend at
+ * /backend-api/codex/images/generations|edits (verified live 2026-07-04, the
+ * same endpoint the Codex app's built-in `image_gen` tool uses). They never
+ * appear in the /codex/models chat catalog, so they are appended to both the
+ * hardcoded and the dynamically fetched model lists.
+ */
+export const CODEX_IMAGE_MODELS: CodexModelInfo[] = [
+    {
+        id: 'gpt-image-2',
+        name: 'GPT Image 2',
+        description: 'GPT Image 2 - image generation and editing via ChatGPT subscription',
+        baseModel: 'gpt-image-2',
+        reasoning: 'none',
+    },
+    {
+        id: 'gpt-image-1.5',
+        name: 'GPT Image 1.5',
+        description: 'GPT Image 1.5 - previous-generation image model via ChatGPT subscription',
+        baseModel: 'gpt-image-1.5',
+        reasoning: 'none',
+    },
+];
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 

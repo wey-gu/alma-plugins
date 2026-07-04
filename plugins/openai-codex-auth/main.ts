@@ -17,7 +17,7 @@
 import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 import { TokenStore } from './lib/token-store';
 import { getAuthorizationUrl, exchangeCodeForTokens } from './lib/auth';
-import { getActiveModels, setCachedModels, buildModelsFromApiResponse, getBaseModelId, getReasoningEffort } from './lib/models';
+import { getActiveModels, setCachedModels, buildModelsFromApiResponse, getBaseModelId, getReasoningEffort, CODEX_IMAGE_MODELS } from './lib/models';
 import { getCodexInstructions } from './lib/codex-instructions';
 import { addAlmaBridgeMessage } from './lib/alma-codex-bridge';
 import { fetchAccountQuota } from './lib/rate-limits';
@@ -44,6 +44,30 @@ const URL_PATHS = {
     RESPONSES: '/responses',
     CODEX_RESPONSES: '/codex/responses',
 } as const;
+
+/**
+ * Aspect-ratio hints Alma sends with image requests, mapped onto sizes that
+ * satisfy gpt-image-2's constraints (edges multiples of 16 and <= 3840px,
+ * long:short ratio <= 3:1, total pixels within 0.65-8.3MP). gpt-image-1.5
+ * only accepts the three classic sizes, so unmapped/legacy ratios fall back
+ * to the backend's `auto` by omitting `size`.
+ */
+const IMAGE_ASPECT_SIZES: Record<string, string> = {
+    '1:1': '1024x1024',
+    '3:2': '1536x1024',
+    '2:3': '1024x1536',
+    '16:9': '2048x1152',
+    '9:16': '1152x2048',
+    '4:3': '1600x1200',
+    '3:4': '1200x1600',
+    '2:1': '2048x1024',
+    '1:2': '1024x2048',
+    '20:9': '2560x1152',
+    '9:20': '1152x2560',
+};
+
+/** Sizes gpt-image-1.x models accept (everything else must fall back to auto). */
+const LEGACY_IMAGE_SIZES = new Set(['1024x1024', '1536x1024', '1024x1536']);
 
 // HTTP status codes (matching opencode)
 const HTTP_STATUS = {
@@ -271,6 +295,86 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 url = input.toString();
             } else {
                 url = input.url;
+            }
+
+            // Step 2.5: Image generation/editing requests take a separate path.
+            // Alma's generateImageViaPluginProvider POSTs Grok-style JSON
+            // ({ model, prompt, response_format, images?: [{url}], aspect_ratio? })
+            // to <baseURL>/images/generations|edits. The Codex subscription
+            // backend serves the Images API at /backend-api/codex/images/* as
+            // JSON (verified live 2026-07-04): generations take
+            // { model, prompt, size? }; edits take
+            // { model, prompt, images: [{ image_url: <data URL> }] }. Responses
+            // already come back as { data: [{ b64_json }] } — exactly the shape
+            // Alma expects — so they pass through untouched.
+            const imageEndpointMatch = url.match(/\/images\/(generations|edits)$/);
+            if (imageEndpointMatch) {
+                const isImageEdit = imageEndpointMatch[1] === 'edits';
+                const imageUrl = url.replace(/\/images\/(generations|edits)$/, '/codex/images/$1');
+                let imageBody = init?.body;
+
+                if (imageBody && typeof imageBody === 'string') {
+                    try {
+                        const parsed = JSON.parse(imageBody);
+                        const model = getBaseModelId(parsed.model || 'gpt-image-2');
+                        const transformed: Record<string, unknown> = {
+                            model,
+                            prompt: parsed.prompt,
+                        };
+
+                        const size = IMAGE_ASPECT_SIZES[parsed.aspect_ratio as string];
+                        if (size && (model === 'gpt-image-2' || LEGACY_IMAGE_SIZES.has(size))) {
+                            transformed.size = size;
+                        }
+
+                        if (isImageEdit) {
+                            const refs: unknown[] = Array.isArray(parsed.images) ? parsed.images : [];
+                            transformed.images = refs
+                                .map((item: any) => (typeof item === 'string' ? item : item?.url ?? item?.image_url))
+                                .filter((u: unknown): u is string => typeof u === 'string')
+                                .map((u: string) => ({ image_url: u }));
+                        }
+
+                        imageBody = JSON.stringify(transformed);
+                        logger.info(`Image ${imageEndpointMatch[1]} request: model=${model}, size=${transformed.size ?? 'auto'}${isImageEdit ? `, refs=${(transformed.images as unknown[]).length}` : ''}`);
+                    } catch (e) {
+                        logger.error('Error transforming image request body:', e);
+                    }
+                }
+
+                const imageHeaders = new Headers(init?.headers ?? {});
+                imageHeaders.delete('x-api-key');
+                imageHeaders.set('Content-Type', 'application/json');
+                imageHeaders.set('Authorization', `Bearer ${accessToken}`);
+                imageHeaders.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
+                imageHeaders.set(OPENAI_HEADERS.ORIGINATOR, 'codex_cli_rs');
+                imageHeaders.set('accept', 'application/json');
+
+                let imageResponse = await globalThis.fetch(imageUrl, {
+                    ...init,
+                    body: imageBody,
+                    headers: imageHeaders,
+                });
+
+                // Same invalidated-token recovery as the chat path: on 401,
+                // force-refresh once and retry.
+                if (imageResponse.status === 401) {
+                    const errText = await imageResponse.clone().text().catch(() => '');
+                    logger.warn(`Image API 401, forcing token refresh and retrying once: ${errText.slice(0, 200)}`);
+                    try {
+                        const newToken = await tokenStore.forceRefreshAccessToken();
+                        imageHeaders.set('Authorization', `Bearer ${newToken}`);
+                        imageResponse = await globalThis.fetch(imageUrl, {
+                            ...init,
+                            body: imageBody,
+                            headers: imageHeaders,
+                        });
+                    } catch (refreshErr) {
+                        logger.error('Forced token refresh failed:', refreshErr);
+                    }
+                }
+
+                return imageResponse;
             }
 
             // Step 3: Rewrite URL for Codex backend: /responses -> /codex/responses
@@ -569,6 +673,28 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         }
     };
 
+    /**
+     * Image models exposed alongside the chat models. imageOutput routes them
+     * through Alma's handleImageGenerationRequest (Images API) instead of chat
+     * completions; vision lets users attach reference images for edits.
+     */
+    const imageModelEntries = () =>
+        CODEX_IMAGE_MODELS.map(model => ({
+            id: model.id,
+            name: model.name,
+            description: model.description,
+            capabilities: {
+                streaming: false,
+                reasoning: false,
+                functionCalling: false,
+                vision: true,
+                imageOutput: true,
+            },
+            providerOptions: {
+                baseModel: model.baseModel,
+            },
+        }));
+
     const providerDisposable = providers.register({
         id: 'openai-codex',
         name: 'OpenAI Codex (ChatGPT)',
@@ -690,22 +816,25 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         },
 
         async getModels() {
-            return getActiveModels().map(model => ({
-                id: model.id,
-                name: model.name,
-                description: model.description,
-                contextWindow: model.contextWindow,
-                maxOutputTokens: model.maxOutputTokens,
-                capabilities: {
-                    streaming: true,
-                    reasoning: model.reasoning !== 'none',
-                    functionCalling: true,
-                },
-                providerOptions: {
-                    reasoning: model.reasoning,
-                    baseModel: model.baseModel,
-                },
-            }));
+            return [
+                ...getActiveModels().map(model => ({
+                    id: model.id,
+                    name: model.name,
+                    description: model.description,
+                    contextWindow: model.contextWindow,
+                    maxOutputTokens: model.maxOutputTokens,
+                    capabilities: {
+                        streaming: true,
+                        reasoning: model.reasoning !== 'none',
+                        functionCalling: true,
+                    },
+                    providerOptions: {
+                        reasoning: model.reasoning,
+                        baseModel: model.baseModel,
+                    },
+                })),
+                ...imageModelEntries(),
+            ];
         },
 
         async fetchModels() {
@@ -745,22 +874,27 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 setCachedModels(models);
                 logger.info(`Fetched and cached ${models.length} models from Codex API`);
 
-                return models.map(model => ({
-                    id: model.id,
-                    name: model.name,
-                    description: model.description,
-                    contextWindow: model.contextWindow,
-                    maxOutputTokens: model.maxOutputTokens,
-                    capabilities: {
-                        streaming: true,
-                        reasoning: model.reasoning !== 'none',
-                        functionCalling: true,
-                    },
-                    providerOptions: {
-                        reasoning: model.reasoning,
-                        baseModel: model.baseModel,
-                    },
-                }));
+                return [
+                    ...models.map(model => ({
+                        id: model.id,
+                        name: model.name,
+                        description: model.description,
+                        contextWindow: model.contextWindow,
+                        maxOutputTokens: model.maxOutputTokens,
+                        capabilities: {
+                            streaming: true,
+                            reasoning: model.reasoning !== 'none',
+                            functionCalling: true,
+                        },
+                        providerOptions: {
+                            reasoning: model.reasoning,
+                            baseModel: model.baseModel,
+                        },
+                    })),
+                    // The /codex/models catalog only lists chat models; image
+                    // models live on the Images API and are appended manually.
+                    ...imageModelEntries(),
+                ];
             } catch (error) {
                 logger.error('Error fetching models:', error);
                 return this.getModels();
