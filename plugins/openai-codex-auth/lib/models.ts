@@ -23,6 +23,15 @@ export function setCachedModels(models: CodexModelInfo[]): void {
     cachedModels = models;
 }
 
+/**
+ * Whether a live/persisted catalog has been loaded into the in-memory cache.
+ * When false, getActiveModels() is serving the stale bundled snapshot, so
+ * callers should hydrate from persisted storage before trusting the list.
+ */
+export function isCatalogCached(): boolean {
+    return cachedModels !== null;
+}
+
 // ============================================================================
 // Dynamic Model Building from /codex/models API
 // ============================================================================
@@ -56,14 +65,20 @@ export function buildModelsFromApiResponse(data: any): CodexModelInfo[] {
         const contextWindow: number = m.context_window || 272000;
         const defaultEffort: ReasoningEffort = (m.default_reasoning_level || 'medium') as ReasoningEffort;
         const levels: Array<{ effort: string }> = m.supported_reasoning_levels || [];
+        const supportedReasoningLevels = levels
+            .map(l => l.effort as ReasoningEffort)
+            .filter((e): e is ReasoningEffort => !!e);
 
-        // Default variant (with the model's default reasoning level)
+        // Default variant (with the model's default reasoning level). Carries the
+        // full supported-levels list so the composer can render a per-model
+        // thinking selector once the variants are collapsed away.
         models.push({
             id: slug,
             name: displayName,
             description,
             baseModel: slug,
             reasoning: defaultEffort,
+            supportedReasoningLevels: supportedReasoningLevels.length ? supportedReasoningLevels : undefined,
             contextWindow,
             maxOutputTokens: 128000,
         });
@@ -590,13 +605,36 @@ export function getModelInfo(modelId: string): CodexModelInfo | undefined {
     return getActiveModels().find(m => m.id === modelId);
 }
 
+const EFFORT_SUFFIXES: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+
+/**
+ * Collapse per-effort reasoning variants into their base model for display, so
+ * the picker shows exactly one entry per model. The composer's thinking selector
+ * drives the effort — and it's now model-aware (renders the levels carried on
+ * `supportedReasoningLevels`), so even max/ultra are reachable without a separate
+ * model entry. The internal catalog stays full (this is display-only) so
+ * id→base/effort resolution is unaffected.
+ */
+export function collapseReasoningVariants(models: CodexModelInfo[]): CodexModelInfo[] {
+    return models.filter(m => m.id === m.baseModel);
+}
+
 /**
  * Get the base model ID for API calls
  * Strips the reasoning suffix to get the actual model name
  */
 export function getBaseModelId(modelId: string): string {
     const model = getModelInfo(modelId);
-    return model?.baseModel ?? modelId;
+    if (model) return model.baseModel;
+    // Fallback when the catalog isn't populated yet (e.g. a request racing the
+    // initial hydration): strip a known reasoning-effort suffix so we never send
+    // an invalid slug like `gpt-5.5-high` to the backend. Without this, an
+    // unresolved variant id was passed through verbatim and rejected — the base
+    // model worked only because its id already equals the backend slug.
+    for (const suffix of EFFORT_SUFFIXES) {
+        if (modelId.endsWith(`-${suffix}`)) return modelId.slice(0, -(suffix.length + 1));
+    }
+    return modelId;
 }
 
 /**
@@ -604,7 +642,12 @@ export function getBaseModelId(modelId: string): string {
  */
 export function getReasoningEffort(modelId: string): ReasoningEffort {
     const model = getModelInfo(modelId);
-    return model?.reasoning ?? 'medium';
+    if (model) return model.reasoning;
+    // Fallback: derive the effort from a known reasoning-effort suffix.
+    for (const suffix of EFFORT_SUFFIXES) {
+        if (modelId.endsWith(`-${suffix}`)) return suffix;
+    }
+    return 'medium';
 }
 
 /**

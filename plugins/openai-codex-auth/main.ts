@@ -17,7 +17,7 @@
 import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 import { TokenStore } from './lib/token-store';
 import { getAuthorizationUrl, exchangeCodeForTokens } from './lib/auth';
-import { getActiveModels, setCachedModels, buildModelsFromApiResponse, getBaseModelId, getReasoningEffort, CODEX_IMAGE_MODELS } from './lib/models';
+import { getActiveModels, setCachedModels, isCatalogCached, buildModelsFromApiResponse, getBaseModelId, getReasoningEffort, collapseReasoningVariants, CODEX_IMAGE_MODELS } from './lib/models';
 import type { CodexModelInfo } from './lib/types';
 import { getCodexInstructions } from './lib/codex-instructions';
 import { addAlmaBridgeMessage } from './lib/alma-codex-bridge';
@@ -398,10 +398,30 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     // Extract prompt_cache_key for caching headers (matching opencode)
                     promptCacheKey = parsed.prompt_cache_key;
 
-                    // Normalize model name (e.g., gpt-5.2-codex-low -> gpt-5.2-codex)
+                    // Normalize model name (e.g., gpt-5.2-codex-low -> gpt-5.2-codex).
+                    // Hydrate first so id→base/effort resolution uses the real
+                    // catalog; the suffix-strip fallback in getBaseModelId still
+                    // covers the (now unlikely) unhydrated case.
+                    await ensureCatalogHydrated();
                     const originalModel = parsed.model || '';
                     const normalizedModel = getBaseModelId(originalModel);
-                    const reasoningEffort = getReasoningEffort(originalModel);
+
+                    // Reasoning-effort resolution.
+                    // - An explicit reasoning variant id (e.g. gpt-5.5-high) is the
+                    //   user's explicit pick and always wins.
+                    // - The base model id (no suffix) honors the composer's reasoning
+                    //   selector, which the core forwards on the request body as
+                    //   `reasoning.effort` (from providerOptions.openai.reasoningEffort).
+                    //   This lets a single base model cover every thinking level, so
+                    //   users no longer need a separate enabled model per effort.
+                    const suffixEffort = getReasoningEffort(originalModel);
+                    const isExplicitVariant = normalizedModel !== originalModel;
+                    const incomingEffort =
+                        typeof parsed?.reasoning?.effort === 'string' &&
+                        ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(parsed.reasoning.effort)
+                            ? parsed.reasoning.effort
+                            : undefined;
+                    const reasoningEffort = isExplicitVariant ? suffixEffort : incomingEffort ?? suffixEffort;
 
                     // Filter and transform input (matching opencode's filterInput function)
                     // This is CRITICAL for Codex API compatibility:
@@ -711,6 +731,42 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
     const MODELS_CACHE_KEY = 'codex-models-cache-v1';
 
+    // Memoized hydration guard. initialize() awaits hydration, but the plugin
+    // host does not reliably await initialize() before the first getModels()
+    // call (observed after a hot-reload: getModels() served the stale snapshot
+    // until a manual Fetch, which in turn made the core read functionCalling as
+    // false and drop the Project/Tools/Skills buttons). So every catalog reader
+    // self-hydrates through this guard: the storage read happens at most once,
+    // and callers past that point always see the persisted catalog.
+    let hydrationPromise: Promise<void> | null = null;
+
+    /**
+     * Ensure the in-memory catalog is populated from persisted storage before a
+     * caller trusts getActiveModels(). Idempotent and concurrency-safe: the
+     * storage read is shared across all callers and skipped once the cache holds
+     * a live/persisted catalog (either from a prior hydrate or a live fetch).
+     */
+    const ensureCatalogHydrated = (): Promise<void> => {
+        if (isCatalogCached()) return Promise.resolve();
+        if (!hydrationPromise) {
+            hydrationPromise = (async () => {
+                try {
+                    const persisted = await storage.local.get<CodexModelInfo[]>(MODELS_CACHE_KEY);
+                    // Re-check isCatalogCached(): a live fetch may have landed
+                    // while the storage read was in flight — never clobber fresher
+                    // data with the persisted snapshot.
+                    if (Array.isArray(persisted) && persisted.length > 0 && !isCatalogCached()) {
+                        setCachedModels(persisted);
+                        logger.info(`Hydrated ${persisted.length} Codex models from storage`);
+                    }
+                } catch (err) {
+                    logger.warn('Failed to hydrate Codex catalog from storage:', err);
+                }
+            })();
+        }
+        return hydrationPromise;
+    };
+
     /** Persist the fetched catalog so it survives restarts. Non-blocking. */
     const persistModelCatalog = (models: CodexModelInfo[]): void => {
         void storage.local.set(MODELS_CACHE_KEY, models).catch(err =>
@@ -763,9 +819,29 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         }
     };
 
-    /** Map the internal catalog to the provider's ProviderModelInfo shape. */
+    /**
+     * Map a model's backend reasoning levels to the composer's thinking-selector
+     * vocabulary. 'off' is always available (handled separately), so only
+     * low..ultra are listed; 'minimal' (which Alma lacks) maps to the nearest
+     * 'low'. Returns undefined when unknown, so the composer falls back to its
+     * default level set. Order is canonical low→ultra.
+     */
+    const COMPOSER_LEVEL_ORDER = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+    const toComposerReasoningLevels = (levels?: CodexModelInfo['supportedReasoningLevels']): string[] | undefined => {
+        if (!levels || levels.length === 0) return undefined;
+        const mapped = new Set(levels.map(l => (l === 'minimal' ? 'low' : l)));
+        const ordered = COMPOSER_LEVEL_ORDER.filter(l => mapped.has(l as CodexModelInfo['reasoning']));
+        return ordered.length ? ordered : undefined;
+    };
+
+    /**
+     * Map the internal catalog to the provider's ProviderModelInfo shape.
+     * Reasoning variants (gpt-5.5-high/-low/-xhigh, …) are collapsed into their
+     * base model — the composer's model-aware thinking selector drives the effort
+     * now (including max/ultra) — so the picker shows a single entry per model.
+     */
     const toProviderModels = (models: CodexModelInfo[]) => [
-        ...models.map(model => ({
+        ...collapseReasoningVariants(models).map(model => ({
             id: model.id,
             name: model.name,
             description: model.description,
@@ -775,6 +851,10 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 streaming: true,
                 reasoning: model.reasoning !== 'none',
                 functionCalling: true,
+                // Per-model supported thinking levels (Alma vocab: 'off' is always
+                // available and handled separately, so only low..ultra are listed).
+                // Lets the composer render a model-aware thinking selector.
+                reasoningLevels: toComposerReasoningLevels(model.supportedReasoningLevels),
             },
             providerOptions: {
                 reasoning: model.reasoning,
@@ -799,15 +879,9 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             // Restore the last-fetched catalog before any getModels() call so
             // cold starts serve real capabilities for models newer than the
             // bundled snapshot (e.g. gpt-5.5) instead of all-false defaults.
-            try {
-                const persisted = await storage.local.get<CodexModelInfo[]>(MODELS_CACHE_KEY);
-                if (Array.isArray(persisted) && persisted.length > 0) {
-                    setCachedModels(persisted);
-                    logger.info(`Restored ${persisted.length} cached Codex models from storage`);
-                }
-            } catch (err) {
-                logger.warn('Failed to restore cached Codex models:', err);
-            }
+            // getModels() also self-hydrates via the same guard, so this is a
+            // best-effort warm-up rather than the sole load path.
+            await ensureCatalogHydrated();
 
             // Refresh the catalog in the background so capabilities load
             // automatically on startup — no manual "Fetch" needed — and brand
@@ -925,14 +999,20 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         },
 
         async getModels() {
+            // Self-hydrate so the very first call after a cold start / reload
+            // returns the persisted catalog (real capabilities) instead of the
+            // stale bundled snapshot — independent of initialize() ordering.
+            await ensureCatalogHydrated();
             return toProviderModels(getActiveModels());
         },
 
         async fetchModels() {
             logger.info('Fetching available models from Codex API...');
             // refreshModelCatalog updates + persists the cache; on any failure
-            // it returns null and we fall back to the cached-or-bundled catalog.
+            // it returns null and we fall back to the cached-or-bundled catalog
+            // (hydrated from storage rather than the raw snapshot).
             const models = await refreshModelCatalog();
+            if (!models) await ensureCatalogHydrated();
             return toProviderModels(models ?? getActiveModels());
         },
 

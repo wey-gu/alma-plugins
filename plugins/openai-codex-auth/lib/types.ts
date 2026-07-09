@@ -65,7 +65,7 @@ export interface OAuthConfig {
 // Model Types
 // ============================================================================
 
-export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 
 export interface CodexModelInfo {
     id: string;
@@ -73,6 +73,10 @@ export interface CodexModelInfo {
     description?: string;
     baseModel: string; // The actual model ID sent to API
     reasoning: ReasoningEffort;
+    // The reasoning efforts this base model supports (from the backend's
+    // supported_reasoning_levels). Carried on the base entry so the composer's
+    // thinking selector can show exactly the levels this model allows.
+    supportedReasoningLevels?: ReasoningEffort[];
     contextWindow?: number;
     maxOutputTokens?: number;
 }
