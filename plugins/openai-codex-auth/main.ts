@@ -18,6 +18,7 @@ import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 import { TokenStore } from './lib/token-store';
 import { getAuthorizationUrl, exchangeCodeForTokens } from './lib/auth';
 import { getActiveModels, setCachedModels, buildModelsFromApiResponse, getBaseModelId, getReasoningEffort, CODEX_IMAGE_MODELS } from './lib/models';
+import type { CodexModelInfo } from './lib/types';
 import { getCodexInstructions } from './lib/codex-instructions';
 import { addAlmaBridgeMessage } from './lib/alma-codex-bridge';
 import { fetchAccountQuota } from './lib/rate-limits';
@@ -695,6 +696,96 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             },
         }));
 
+    // =========================================================================
+    // Model catalog persistence
+    //
+    // The bundled CODEX_MODELS list is a snapshot that lags the live backend.
+    // The freshly fetched catalog used to live only in an in-memory module
+    // cache (setCachedModels), so every cold start fell back to the stale
+    // snapshot — any enabled model newer than the snapshot (e.g. gpt-5.5) had
+    // no catalog entry, and GET /api/models reported all-false capabilities
+    // until the user manually clicked "Fetch". Persisting the catalog and
+    // restoring it on startup (plus a background refresh) makes capabilities
+    // load automatically on every launch.
+    // =========================================================================
+
+    const MODELS_CACHE_KEY = 'codex-models-cache-v1';
+
+    /** Persist the fetched catalog so it survives restarts. Non-blocking. */
+    const persistModelCatalog = (models: CodexModelInfo[]): void => {
+        void storage.local.set(MODELS_CACHE_KEY, models).catch(err =>
+            logger.warn('Failed to persist Codex model catalog:', err),
+        );
+    };
+
+    /**
+     * Fetch the live catalog from the Codex API, update the in-memory cache and
+     * persist it. Returns the models on success, or null when unavailable (no
+     * account / network error / empty response) so callers can fall back to the
+     * cached-or-bundled catalog.
+     */
+    const refreshModelCatalog = async (): Promise<CodexModelInfo[] | null> => {
+        const accountId = tokenStore.getAccountId();
+        if (!accountId) return null;
+        try {
+            const accessToken = await tokenStore.getValidAccessToken();
+            const response = await globalThis.fetch(
+                `${CODEX_BASE_URL}/codex/models?client_version=1.0.0`,
+                {
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        [OPENAI_HEADERS.ACCOUNT_ID]: accountId,
+                        [OPENAI_HEADERS.ORIGINATOR]: 'codex_cli_rs',
+                        [OPENAI_HEADERS.BETA]: 'responses=experimental',
+                    },
+                },
+            );
+
+            if (!response.ok) {
+                logger.warn(`Failed to fetch models: ${response.status}`);
+                return null;
+            }
+
+            const data = await response.json();
+            const models = buildModelsFromApiResponse(data);
+            if (models.length === 0) {
+                logger.warn('No models found in API response');
+                return null;
+            }
+
+            setCachedModels(models);
+            persistModelCatalog(models);
+            logger.info(`Fetched and cached ${models.length} models from Codex API`);
+            return models;
+        } catch (error) {
+            logger.error('Error fetching models:', error);
+            return null;
+        }
+    };
+
+    /** Map the internal catalog to the provider's ProviderModelInfo shape. */
+    const toProviderModels = (models: CodexModelInfo[]) => [
+        ...models.map(model => ({
+            id: model.id,
+            name: model.name,
+            description: model.description,
+            contextWindow: model.contextWindow,
+            maxOutputTokens: model.maxOutputTokens,
+            capabilities: {
+                streaming: true,
+                reasoning: model.reasoning !== 'none',
+                functionCalling: true,
+            },
+            providerOptions: {
+                reasoning: model.reasoning,
+                baseModel: model.baseModel,
+            },
+        })),
+        // The /codex/models catalog only lists chat models; image models live on
+        // the Images API and are appended manually.
+        ...imageModelEntries(),
+    ];
+
     const providerDisposable = providers.register({
         id: 'openai-codex',
         name: 'OpenAI Codex (ChatGPT)',
@@ -704,6 +795,24 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
         async initialize() {
             logger.info('Codex provider initialized');
+
+            // Restore the last-fetched catalog before any getModels() call so
+            // cold starts serve real capabilities for models newer than the
+            // bundled snapshot (e.g. gpt-5.5) instead of all-false defaults.
+            try {
+                const persisted = await storage.local.get<CodexModelInfo[]>(MODELS_CACHE_KEY);
+                if (Array.isArray(persisted) && persisted.length > 0) {
+                    setCachedModels(persisted);
+                    logger.info(`Restored ${persisted.length} cached Codex models from storage`);
+                }
+            } catch (err) {
+                logger.warn('Failed to restore cached Codex models:', err);
+            }
+
+            // Refresh the catalog in the background so capabilities load
+            // automatically on startup — no manual "Fetch" needed — and brand
+            // new backend models are picked up. Non-blocking.
+            void refreshModelCatalog();
 
             // Warm quota + profile caches in the background so the settings
             // page shows fresh data the first time it renders. Non-blocking.
@@ -816,89 +925,15 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         },
 
         async getModels() {
-            return [
-                ...getActiveModels().map(model => ({
-                    id: model.id,
-                    name: model.name,
-                    description: model.description,
-                    contextWindow: model.contextWindow,
-                    maxOutputTokens: model.maxOutputTokens,
-                    capabilities: {
-                        streaming: true,
-                        reasoning: model.reasoning !== 'none',
-                        functionCalling: true,
-                    },
-                    providerOptions: {
-                        reasoning: model.reasoning,
-                        baseModel: model.baseModel,
-                    },
-                })),
-                ...imageModelEntries(),
-            ];
+            return toProviderModels(getActiveModels());
         },
 
         async fetchModels() {
             logger.info('Fetching available models from Codex API...');
-            try {
-                const accessToken = await tokenStore.getValidAccessToken();
-                const accountId = tokenStore.getAccountId();
-                if (!accountId) {
-                    logger.warn('No account ID, returning default models');
-                    return this.getModels();
-                }
-
-                const response = await globalThis.fetch(
-                    `${CODEX_BASE_URL}/codex/models?client_version=1.0.0`,
-                    {
-                        headers: {
-                            'Authorization': `Bearer ${accessToken}`,
-                            [OPENAI_HEADERS.ACCOUNT_ID]: accountId,
-                            [OPENAI_HEADERS.ORIGINATOR]: 'codex_cli_rs',
-                            [OPENAI_HEADERS.BETA]: 'responses=experimental',
-                        },
-                    },
-                );
-
-                if (!response.ok) {
-                    logger.warn(`Failed to fetch models: ${response.status}`);
-                    return this.getModels();
-                }
-
-                const data = await response.json();
-                const models = buildModelsFromApiResponse(data);
-                if (models.length === 0) {
-                    logger.warn('No models found in API response');
-                    return this.getModels();
-                }
-
-                setCachedModels(models);
-                logger.info(`Fetched and cached ${models.length} models from Codex API`);
-
-                return [
-                    ...models.map(model => ({
-                        id: model.id,
-                        name: model.name,
-                        description: model.description,
-                        contextWindow: model.contextWindow,
-                        maxOutputTokens: model.maxOutputTokens,
-                        capabilities: {
-                            streaming: true,
-                            reasoning: model.reasoning !== 'none',
-                            functionCalling: true,
-                        },
-                        providerOptions: {
-                            reasoning: model.reasoning,
-                            baseModel: model.baseModel,
-                        },
-                    })),
-                    // The /codex/models catalog only lists chat models; image
-                    // models live on the Images API and are appended manually.
-                    ...imageModelEntries(),
-                ];
-            } catch (error) {
-                logger.error('Error fetching models:', error);
-                return this.getModels();
-            }
+            // refreshModelCatalog updates + persists the cache; on any failure
+            // it returns null and we fall back to the cached-or-bundled catalog.
+            const models = await refreshModelCatalog();
+            return toProviderModels(models ?? getActiveModels());
         },
 
         /**
