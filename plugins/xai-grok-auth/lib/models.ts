@@ -22,7 +22,23 @@ export interface XaiModel {
 }
 
 // Fallback catalog (context/output limits from models.dev + live API, July 2026).
+//
+// Keep current flagship chat models here even though the live catalog also
+// returns them: a cold start serves this list until a live fetch populates the
+// in-memory cache, and any *enabled* model missing from it gets all-false
+// capabilities from the app (functionCalling:false), which silently hides the
+// composer's Project/Tools/Skills row. See initialize() in main.ts.
 const FALLBACK_MODELS: XaiModel[] = [
+    {
+        id: 'grok-4.5',
+        name: 'Grok 4.5',
+        description: 'Flagship reasoning model',
+        contextWindow: 2_000_000,
+        maxOutputTokens: 30_000,
+        reasoning: true,
+        vision: true,
+        imageOutput: false,
+    },
     {
         id: 'grok-4.3',
         name: 'Grok 4.3',
@@ -118,6 +134,15 @@ export function setCachedModels(models: XaiModel[]): void {
     if (models.length > 0) {
         cachedModels = models;
     }
+}
+
+/**
+ * Whether a live/persisted catalog has been loaded into the in-memory cache.
+ * When false, getActiveModels() is serving the bundled FALLBACK_MODELS snapshot,
+ * so callers should hydrate from persisted storage before trusting the list.
+ */
+export function isCatalogCached(): boolean {
+    return cachedModels !== null;
 }
 
 // ============================================================================

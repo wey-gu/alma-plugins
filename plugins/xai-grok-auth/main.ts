@@ -19,7 +19,7 @@ import {
     OAUTH_CALLBACK_PATH,
     CORS_ORIGINS,
 } from './lib/auth';
-import { getActiveModels, setCachedModels, buildModelsFromApiResponse, type XaiModel } from './lib/models';
+import { getActiveModels, setCachedModels, isCatalogCached, buildModelsFromApiResponse, type XaiModel } from './lib/models';
 import { fetchUserInfo, avatarUrlForEmail } from './lib/profile';
 import { quotaFromHeaders } from './lib/rate-limits';
 
@@ -175,6 +175,76 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         return fetchCatalog('/models');
     };
 
+    // The live catalog cache (setCachedModels) lives only in memory, so every
+    // cold start fell back to the bundled FALLBACK_MODELS snapshot. Any enabled
+    // model newer than that snapshot (e.g. grok-4.5) had no catalog entry, so
+    // GET /api/models reported all-false capabilities — hiding the composer's
+    // Project/Tools/Skills row — until the user manually clicked "Fetch".
+    // Persisting the catalog and restoring it on startup (plus a background
+    // refresh) makes capabilities load automatically on every launch.
+    const MODELS_CACHE_KEY = 'xai-models-cache-v1';
+
+    // Memoized hydration guard. initialize() awaits hydration, but the plugin
+    // host does not reliably await initialize() before the first getModels()
+    // call (after a hot-reload getModels() served the stale FALLBACK snapshot
+    // until a manual Fetch, which made the core read functionCalling as false
+    // and hide the Project/Tools/Skills row). So catalog readers self-hydrate
+    // through this guard: the storage read happens at most once.
+    let hydrationPromise: Promise<void> | null = null;
+
+    /**
+     * Ensure the in-memory catalog is populated from persisted storage before a
+     * caller trusts getActiveModels(). Idempotent and concurrency-safe.
+     */
+    const ensureCatalogHydrated = (): Promise<void> => {
+        if (isCatalogCached()) return Promise.resolve();
+        if (!hydrationPromise) {
+            hydrationPromise = (async () => {
+                try {
+                    const persisted = await storage.local.get<XaiModel[]>(MODELS_CACHE_KEY);
+                    // Re-check: a live fetch may have landed while the storage
+                    // read was in flight — never clobber fresher data.
+                    if (Array.isArray(persisted) && persisted.length > 0 && !isCatalogCached()) {
+                        setCachedModels(persisted);
+                        logger.info(`Hydrated ${persisted.length} xAI models from storage`);
+                    }
+                } catch (err) {
+                    logger.warn('Failed to hydrate xAI catalog from storage:', err);
+                }
+            })();
+        }
+        return hydrationPromise;
+    };
+
+    /** Persist the fetched catalog so it survives restarts. Non-blocking. */
+    const persistModelCatalog = (models: XaiModel[]): void => {
+        void storage.local.set(MODELS_CACHE_KEY, models).catch(err => logger.warn('Failed to persist xAI model catalog:', err));
+    };
+
+    /**
+     * Fetch the live catalog, update the in-memory cache and persist it.
+     * Returns the models on success, or null when unavailable (not logged in /
+     * network error / empty response) so callers can fall back to the
+     * cached-or-bundled catalog.
+     */
+    const refreshModelCatalog = async (): Promise<XaiModel[] | null> => {
+        if (!tokenStore.hasTokens()) return null;
+        try {
+            const models = await fetchLiveModels();
+            if (models.length === 0) {
+                logger.warn('No chat models found in xAI API response');
+                return null;
+            }
+            setCachedModels(models);
+            persistModelCatalog(models);
+            logger.info(`Fetched and cached ${models.length} models from xAI API`);
+            return models;
+        } catch (error) {
+            logger.error('Error fetching xAI models:', error);
+            return null;
+        }
+    };
+
     // =========================================================================
     // Register Provider
     // =========================================================================
@@ -186,6 +256,20 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         authType: 'oauth',
         sdkType: 'openai-compatible',
         supportsMultiAccount: true,
+
+        async initialize() {
+            // Restore the last-fetched catalog before any getModels() call so
+            // cold starts serve real capabilities for models newer than the
+            // bundled snapshot (e.g. grok-4.5) instead of all-false defaults.
+            // getModels() also self-hydrates via the same guard, so this is a
+            // best-effort warm-up rather than the sole load path.
+            await ensureCatalogHydrated();
+
+            // Refresh in the background so capabilities load automatically on
+            // startup — no manual "Fetch" needed — and brand new backend models
+            // are picked up. Non-blocking.
+            void refreshModelCatalog();
+        },
 
         async isAuthenticated() {
             return tokenStore.hasTokens();
@@ -298,26 +382,23 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         },
 
         async getModels() {
+            // Self-hydrate so the first call after a cold start / reload returns
+            // the persisted catalog (real capabilities) instead of the bundled
+            // snapshot — independent of initialize() ordering.
+            await ensureCatalogHydrated();
             return getActiveModels().map(toProviderModel);
         },
 
         async fetchModels() {
             logger.info('Fetching available models from xAI API...');
-            try {
-                const models = await fetchLiveModels();
-                if (models.length === 0) {
-                    logger.warn('No chat models found in xAI API response, using fallback list');
-                    return this.getModels();
-                }
-                setCachedModels(models);
-                logger.info(`Fetched and cached ${models.length} models from xAI API`);
-                // getActiveModels merges curated extras (e.g. grok-composer-2.5-fast)
-                // that the live catalogs never return.
-                return getActiveModels().map(toProviderModel);
-            } catch (error) {
-                logger.error('Error fetching xAI models:', error);
+            const models = await refreshModelCatalog();
+            if (!models) {
+                logger.warn('Live fetch unavailable, using cached/fallback list');
                 return this.getModels();
             }
+            // getActiveModels merges curated extras (e.g. grok-composer-2.5-fast)
+            // that the live catalogs never return.
+            return getActiveModels().map(toProviderModel);
         },
 
         async getSDKConfig() {
