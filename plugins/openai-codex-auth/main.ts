@@ -31,6 +31,12 @@ import { fetchAccountProfile, avatarUrlForEmail } from './lib/profile';
 const CODEX_BASE_URL = 'https://chatgpt.com/backend-api';
 const DUMMY_API_KEY = 'chatgpt-oauth';
 
+// The Codex backend gates newer models (e.g. gpt-5.6-luna) on a User-Agent
+// that identifies a known Codex client — without it /codex/responses 404s
+// with "Model not found" even though the model is in the /codex/models
+// catalog. Verified 2026-07: default undici UA → 404, codex_cli_rs UA → 200.
+const CODEX_USER_AGENT = 'codex_cli_rs/0.144.0 (Mac OS 26.0.0; arm64) Apple_Terminal/455';
+
 // OpenAI-specific headers (matching opencode)
 const OPENAI_HEADERS = {
     BETA: 'OpenAI-Beta',
@@ -349,6 +355,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 imageHeaders.set('Authorization', `Bearer ${accessToken}`);
                 imageHeaders.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
                 imageHeaders.set(OPENAI_HEADERS.ORIGINATOR, 'codex_cli_rs');
+                imageHeaders.set('User-Agent', CODEX_USER_AGENT);
                 imageHeaders.set('accept', 'application/json');
 
                 let imageResponse = await globalThis.fetch(imageUrl, {
@@ -572,6 +579,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
             headers.set(OPENAI_HEADERS.BETA, 'responses=experimental');
             headers.set(OPENAI_HEADERS.ORIGINATOR, 'codex_cli_rs');
+            headers.set('User-Agent', CODEX_USER_AGENT);
             headers.set('accept', 'text/event-stream');
 
             // Set prompt cache headers if prompt_cache_key is present (matching opencode)
@@ -793,6 +801,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                         [OPENAI_HEADERS.ACCOUNT_ID]: accountId,
                         [OPENAI_HEADERS.ORIGINATOR]: 'codex_cli_rs',
                         [OPENAI_HEADERS.BETA]: 'responses=experimental',
+                        'User-Agent': CODEX_USER_AGENT,
                     },
                 },
             );
