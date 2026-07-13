@@ -4971,11 +4971,35 @@ function parseConnectEndStream(data) {
   try {
     const p = JSON.parse(new TextDecoder().decode(data));
     if (p?.error)
-      return new Error(`Connect error ${p.error.code ?? "unknown"}: ${p.error.message ?? "Unknown"}`);
+      return new Error(formatConnectError(p.error));
     return null;
   } catch {
     return new Error("Failed to parse Connect end stream");
   }
+}
+function formatConnectError(error) {
+  const code = error.code ?? "unknown";
+  let message = error.message ?? "Unknown";
+  const details = Array.isArray(error.details) ? error.details : [];
+  for (const d of details) {
+    const debug = d?.debug;
+    const dd = debug?.details;
+    if (dd?.title || dd?.detail) {
+      message = [dd.title, dd.detail].filter(Boolean).join(" — ");
+      const buttons = Array.isArray(dd.buttons) ? dd.buttons : [];
+      const urls = buttons.map((b) => b?.url?.url).filter(Boolean);
+      if (urls.length > 0)
+        message += ` (see ${urls.join(", ")})`;
+      if (buttons.some((b) => b?.dashboardAction)) {
+        message += " — open Cursor IDE, select this model once and accept the prompt, then retry here.";
+      }
+      break;
+    }
+    if (typeof debug?.error === "string" && debug.error) {
+      message = message === "Error" ? debug.error : `${message} (${debug.error})`;
+    }
+  }
+  return `Connect error ${code}: ${message}`;
 }
 function makeHeartbeatBytes() {
   return frameConnectMessage(toBinary(AgentClientMessageSchema, create(AgentClientMessageSchema, { message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) } })));
@@ -5290,6 +5314,7 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
   let pendingBuffer = Buffer.alloc(0);
   const collectedToolCalls = [];
   let responded = false;
+  let endStreamError = null;
   const state = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
   const cleanup = () => {
     clearInterval(heartbeatTimer);
@@ -5345,8 +5370,14 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
         break;
       const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
       pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-      if (flags & CONNECT_END_STREAM_FLAG)
+      if (flags & CONNECT_END_STREAM_FLAG) {
+        const e = parseConnectEndStream(messageBytes);
+        if (e) {
+          endStreamError = e;
+          logger.error("Cursor proxy non-stream end-stream error:", e.message);
+        }
         continue;
+      }
       try {
         processServerMessage(fromBinary(AgentServerMessageSchema, messageBytes), payload.blobStore, payload.mcpTools, (data) => {
           if (!h2Stream.closed && !h2Stream.destroyed)
@@ -5369,6 +5400,8 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
   h2Stream.on("end", () => {
     if (collectedToolCalls.length > 0)
       respond("tool_calls");
+    else if (endStreamError)
+      respond("error", endStreamError.message);
     else
       respond("stop");
   });

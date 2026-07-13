@@ -699,9 +699,40 @@ function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
 function parseConnectEndStream(data: Uint8Array): Error | null {
     try {
         const p = JSON.parse(new TextDecoder().decode(data));
-        if (p?.error) return new Error(`Connect error ${p.error.code ?? 'unknown'}: ${p.error.message ?? 'Unknown'}`);
+        if (p?.error) return new Error(formatConnectError(p.error));
         return null;
     } catch { return new Error('Failed to parse Connect end stream'); }
+}
+
+/**
+ * Cursor buries the human-readable reason in error.details[].debug.details
+ * (title/detail/buttons); the top-level message is often the literal string
+ * "Error". Observed live with ERROR_MODEL_BLOCKED: "You must acknowledge
+ * Fable 5's data retention policy to use the model." — without this parsing
+ * the user just sees "failed_precondition: Error".
+ */
+function formatConnectError(error: any): string {
+    const code = error.code ?? 'unknown';
+    let message: string = error.message ?? 'Unknown';
+    const details = Array.isArray(error.details) ? error.details : [];
+    for (const d of details) {
+        const debug = d?.debug;
+        const dd = debug?.details;
+        if (dd?.title || dd?.detail) {
+            message = [dd.title, dd.detail].filter(Boolean).join(' — ');
+            const buttons: any[] = Array.isArray(dd.buttons) ? dd.buttons : [];
+            const urls = buttons.map((b) => b?.url?.url).filter(Boolean);
+            if (urls.length > 0) message += ` (see ${urls.join(', ')})`;
+            if (buttons.some((b) => b?.dashboardAction)) {
+                message += ' — open Cursor IDE, select this model once and accept the prompt, then retry here.';
+            }
+            break;
+        }
+        if (typeof debug?.error === 'string' && debug.error) {
+            message = message === 'Error' ? debug.error : `${message} (${debug.error})`;
+        }
+    }
+    return `Connect error ${code}: ${message}`;
 }
 
 function makeHeartbeatBytes(): Buffer {
@@ -931,6 +962,7 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
     let pendingBuffer = Buffer.alloc(0);
     const collectedToolCalls: Array<{ id: string; name: string; argsJson: string }> = [];
     let responded = false;
+    let endStreamError: Error | null = null;
     const state: StreamState = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
 
     const cleanup = () => {
@@ -977,7 +1009,16 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
             if (pendingBuffer.length < 5 + msgLen) break;
             const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
             pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-            if (flags & CONNECT_END_STREAM_FLAG) continue;
+            if (flags & CONNECT_END_STREAM_FLAG) {
+                // Surface server-side rejections (e.g. ERROR_MODEL_BLOCKED)
+                // instead of silently returning empty content.
+                const e = parseConnectEndStream(messageBytes);
+                if (e) {
+                    endStreamError = e;
+                    logger.error('Cursor proxy non-stream end-stream error:', e.message);
+                }
+                continue;
+            }
             try {
                 processServerMessage(
                     fromBinary(AgentServerMessageSchema, messageBytes),
@@ -1009,6 +1050,7 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
 
     h2Stream.on('end', () => {
         if (collectedToolCalls.length > 0) respond('tool_calls');
+        else if (endStreamError) respond('error', endStreamError.message);
         else respond('stop');
     });
 
