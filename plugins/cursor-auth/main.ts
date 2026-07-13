@@ -17,10 +17,12 @@
 import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 import { TokenStore } from './lib/token-store';
 import { generateCursorAuthParams, pollCursorAuth, getTokenExpiry } from './lib/auth';
-import { getCursorModels, getFallbackModels } from './lib/models';
+import { getCursorModels, getFallbackModels, collapseCursorModels, hydrateCatalog, setCatalogListener } from './lib/models';
 import { startProxy, stopProxy, createProxyFetch } from './lib/cursor-fetch';
+import type { CursorModel } from './lib/types';
 
 const DUMMY_API_KEY = 'cursor-proxy';
+const MODELS_CACHE_KEY = 'cursor-model-catalog-v1';
 
 // ============================================================================
 // Plugin Activation
@@ -34,6 +36,65 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     // Initialize token store
     const tokenStore = new TokenStore(storage.secrets, logger);
     await tokenStore.initialize();
+
+    // Persist every fresh catalog and hydrate the last one on startup, so
+    // request-time variant resolution (collapsed id + reasoning effort →
+    // concrete Cursor slug) works before the first live fetch lands.
+    setCatalogListener(models => {
+        void storage.local.set(MODELS_CACHE_KEY, models).catch((err: unknown) => logger.warn('Failed to persist Cursor model catalog:', err));
+    });
+    const catalogHydration: Promise<void> = (async () => {
+        try {
+            const persisted = await storage.local.get<CursorModel[]>(MODELS_CACHE_KEY);
+            hydrateCatalog(persisted);
+            if (Array.isArray(persisted) && persisted.length > 0) {
+                logger.info(`Hydrated ${persisted.length} Cursor models from storage`);
+            }
+        } catch (err) {
+            logger.warn('Failed to hydrate Cursor model catalog from storage:', err);
+        }
+    })();
+
+    /**
+     * Map the raw catalog to picker entries: effort/thinking variants collapse
+     * into one entry per family whose tier is driven by the composer's
+     * model-aware thinking selector (capabilities.reasoningLevels).
+     */
+    const toProviderModels = (models: CursorModel[]) =>
+        collapseCursorModels(models).map(model => ({
+            id: model.id,
+            name: model.name,
+            description:
+                model.variantCount > 1
+                    ? `Cursor: ${model.name} — ${model.variantCount} effort variants merged; the thinking selector picks the tier`
+                    : `Cursor: ${model.name}${model.reasoning ? ' (reasoning)' : ''}`,
+            contextWindow: model.contextWindow,
+            maxOutputTokens: model.maxTokens,
+            capabilities: {
+                temperature: true,
+                streaming: true,
+                reasoning: model.reasoning,
+                attachment: false,
+                functionCalling: true,
+                // Per-model thinking levels so the composer renders a
+                // model-aware effort selector (same contract as codex plugin).
+                ...(model.reasoningLevels ? { reasoningLevels: model.reasoningLevels } : {}),
+                input: {
+                    text: true,
+                    audio: false,
+                    image: true,
+                    video: false,
+                    pdf: false,
+                },
+                output: {
+                    text: true,
+                    audio: false,
+                    image: false,
+                    video: false,
+                    pdf: false,
+                },
+            },
+        }));
 
     // Proxy port (set when proxy starts)
     let currentProxyPort: number | undefined;
@@ -106,76 +167,24 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         },
 
         async getModels() {
+            await catalogHydration;
             const tokens = tokenStore.getTokens();
             const models = tokens
                 ? await getCursorModels(tokens.access_token).catch(() => getFallbackModels())
                 : getFallbackModels();
 
-            return models.map(model => ({
-                id: model.id,
-                name: model.name,
-                description: `Cursor: ${model.name}${model.reasoning ? ' (reasoning)' : ''}`,
-                contextWindow: model.contextWindow,
-                maxOutputTokens: model.maxTokens,
-                capabilities: {
-                    temperature: true,
-                    streaming: true,
-                    reasoning: model.reasoning,
-                    attachment: false,
-                    functionCalling: true,
-                    input: {
-                        text: true,
-                        audio: false,
-                        image: true,
-                        video: false,
-                        pdf: false,
-                    },
-                    output: {
-                        text: true,
-                        audio: false,
-                        image: false,
-                        video: false,
-                        pdf: false,
-                    },
-                },
-            }));
+            return toProviderModels(models);
         },
 
         async fetchModels() {
             logger.info('Fetching available models from Cursor API...');
             try {
+                await catalogHydration;
                 const accessToken = await tokenStore.getValidAccessToken();
                 const models = await getCursorModels(accessToken);
-                logger.info(`Fetched ${models.length} models from Cursor API`);
-
-                return models.map(model => ({
-                    id: model.id,
-                    name: model.name,
-                    description: `Cursor: ${model.name}${model.reasoning ? ' (reasoning)' : ''}`,
-                    contextWindow: model.contextWindow,
-                    maxOutputTokens: model.maxTokens,
-                    capabilities: {
-                        temperature: true,
-                        streaming: true,
-                        reasoning: model.reasoning,
-                        attachment: false,
-                        functionCalling: true,
-                        input: {
-                            text: true,
-                            audio: false,
-                            image: false,
-                            video: false,
-                            pdf: false,
-                        },
-                        output: {
-                            text: true,
-                            audio: false,
-                            image: false,
-                            video: false,
-                            pdf: false,
-                        },
-                    },
-                }));
+                const collapsed = toProviderModels(models);
+                logger.info(`Fetched ${models.length} models from Cursor API (collapsed to ${collapsed.length} picker entries)`);
+                return collapsed;
             } catch (error) {
                 logger.error('Error fetching models:', error);
                 return this.getModels();
@@ -190,6 +199,9 @@ export async function activate(context: PluginContext): Promise<PluginActivation
          * - fetch strips auth headers (proxy handles auth internally)
          */
         async getSDKConfig() {
+            // Variant resolution in the proxy needs the catalog — make sure the
+            // persisted one is loaded before the first request can race it.
+            await catalogHydration;
             const port = await ensureProxy();
             return {
                 apiKey: DUMMY_API_KEY,
