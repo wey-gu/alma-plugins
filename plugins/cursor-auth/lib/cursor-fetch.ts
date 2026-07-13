@@ -64,6 +64,7 @@ import {
     SetBlobResultSchema,
     ShellRejectedSchema,
     ShellResultSchema,
+    ShellStreamSchema,
     ToolCallSchema,
     UserMessageActionSchema,
     UserMessageSchema,
@@ -325,13 +326,42 @@ function handleChatCompletion(
     }
 
     const mcpTools = buildMcpToolDefinitions(tools);
-    const payload = buildCursorRequest(modelId, systemPrompt, effectiveUserText, images);
+
+    // The AI SDK only sends an explicit `stream: true` for streaming calls
+    // (streamText); non-streaming calls (generateText — tool analysis, the
+    // Tool Model test, title generation) OMIT the field entirely. Treating
+    // "not false" as streaming handed SSE to JSON-expecting clients, which
+    // broke every generateText call through this provider.
+    const isStreaming = body.stream === true;
+
+    // Tool-less non-streaming calls (generateText utilities: tool analysis,
+    // title generation) want a plain answer, not agentic behavior.
+    const isUtilityCall = !isStreaming && mcpTools.length === 0;
+
+    // ASK mode discourages Cursor's built-in workspace tools (shell/ls/read),
+    // which this proxy has to reject anyway.
+    const mode = isUtilityCall ? AGENT_MODE_ASK : undefined;
+
+    // Cursor's backend is an agent harness: the root system prompt is weak
+    // context there, and the model treats the embedded user message as a task
+    // to EXECUTE (observed live: a tool-analysis prompt got back "I can't
+    // access your ~/Downloads, run this command yourself" instead of the
+    // requested JSON). Inlining the instructions into the live message makes
+    // them binding again.
+    let promptSystem = systemPrompt;
+    let promptUser = effectiveUserText;
+    if (isUtilityCall && systemPrompt) {
+        promptUser = `<instructions>\n${systemPrompt}\n</instructions>\n\n${effectiveUserText}\n\n(Follow <instructions> exactly. Do NOT attempt to execute the task yourself — no tools.)`;
+        promptSystem = '';
+    }
+
+    const payload = buildCursorRequest(modelId, promptSystem, promptUser, images, mode);
     payload.mcpTools = mcpTools;
 
-    if (body.stream === false) {
-        handleNonStreaming(payload, accessToken, modelId, res, logger);
-    } else {
+    if (isStreaming) {
         handleStreaming(payload, accessToken, modelId, sessionKey, res);
+    } else {
+        handleNonStreaming(payload, accessToken, modelId, res, logger);
     }
 }
 
@@ -606,7 +636,11 @@ function buildHistoryToolCallStep(tc: HistoryToolCall): Uint8Array {
     }));
 }
 
-function buildCursorRequest(modelId: string, systemPrompt: string, userText: string, images: ImageData[]): CursorRequestPayload {
+// agent.v1.AgentMode.ASK — plain Q&A mode; the server never invokes
+// workspace tools (shell/read/ls), which this proxy has to reject anyway.
+const AGENT_MODE_ASK = 2;
+
+function buildCursorRequest(modelId: string, systemPrompt: string, userText: string, images: ImageData[], mode?: number): CursorRequestPayload {
     const blobStore = new Map<string, Uint8Array>();
 
     const systemJson = JSON.stringify({ role: 'system', content: systemPrompt });
@@ -623,6 +657,7 @@ function buildCursorRequest(modelId: string, systemPrompt: string, userText: str
         todos: [], pendingToolCalls: [], previousWorkspaceUris: [],
         fileStates: {}, fileStatesV2: {}, summaryArchives: [], turnTimings: [],
         subagentStates: {}, selfSummaryCount: 0, readPaths: [],
+        ...(mode !== undefined && { mode }),
     });
 
     // Build UserMessage with optional image support via selectedContext
@@ -723,7 +758,9 @@ function handleKvMessage(kv: KvServerMessage, blobStore: Map<string, Uint8Array>
 
 function handleExecMessage(exec: ExecServerMessage, mcpTools: McpToolDefinition[], sendFrame: (data: Buffer) => void, onMcpExec: (e: PendingExec) => void): void {
     const c = exec.message.case;
-    const R = 'Tool not available in this environment. Use the MCP tools provided instead.';
+    const R = mcpTools.length > 0
+        ? 'Tool not available in this environment. Use the MCP tools provided instead.'
+        : 'Tool not available in this environment. Do not retry tools — answer directly in your final message.';
 
     if (c === 'requestContextArgs') {
         const ctx = create(RequestContextSchema, { rules: [], repositoryInfo: [], tools: mcpTools, gitRepos: [], projectLayouts: [], mcpInstructions: [], fileContents: {}, customSubagents: [] });
@@ -736,7 +773,11 @@ function handleExecMessage(exec: ExecServerMessage, mcpTools: McpToolDefinition[
     else if (c === 'grepArgs') sendExec(exec, 'grepResult', create(GrepResultSchema, { result: { case: 'error', value: create(GrepErrorSchema, { error: R }) } }), sendFrame);
     else if (c === 'writeArgs') sendExec(exec, 'writeResult', create(WriteResultSchema, { result: { case: 'rejected', value: create(WriteRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
     else if (c === 'deleteArgs') sendExec(exec, 'deleteResult', create(DeleteResultSchema, { result: { case: 'rejected', value: create(DeleteRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
-    else if (c === 'shellArgs' || c === 'shellStreamArgs') { const a = exec.message.value; sendExec(exec, 'shellResult', create(ShellResultSchema, { result: { case: 'rejected', value: create(ShellRejectedSchema, { command: a.command ?? '', workingDirectory: a.workingDirectory ?? '', reason: R, isReadonly: false }) } }), sendFrame); }
+    else if (c === 'shellArgs') { const a = exec.message.value; sendExec(exec, 'shellResult', create(ShellResultSchema, { result: { case: 'rejected', value: create(ShellRejectedSchema, { command: a.command ?? '', workingDirectory: a.workingDirectory ?? '', reason: R, isReadonly: false }) } }), sendFrame); }
+    // Streaming shell calls must be answered on the `shellStream` case — a
+    // plain shellResult is silently ignored by the server, which then waits
+    // on the exec forever and stalls the whole turn (observed 2026-07-13).
+    else if (c === 'shellStreamArgs') { const a = exec.message.value; sendExec(exec, 'shellStream', create(ShellStreamSchema, { event: { case: 'rejected', value: create(ShellRejectedSchema, { command: a.command ?? '', workingDirectory: a.workingDirectory ?? '', reason: R, isReadonly: false }) } }), sendFrame); }
     else if (c === 'backgroundShellSpawnArgs') { const a = exec.message.value; sendExec(exec, 'backgroundShellSpawnResult', create(BackgroundShellSpawnResultSchema, { result: { case: 'rejected', value: create(ShellRejectedSchema, { command: a.command ?? '', workingDirectory: a.workingDirectory ?? '', reason: R, isReadonly: false }) } }), sendFrame); }
     else if (c === 'writeShellStdinArgs') sendExec(exec, 'writeShellStdinResult', create(WriteShellStdinResultSchema, { result: { case: 'error', value: create(WriteShellStdinErrorSchema, { error: R }) } }), sendFrame);
     else if (c === 'fetchArgs') sendExec(exec, 'fetchResult', create(FetchResultSchema, { result: { case: 'error', value: create(FetchErrorSchema, { url: exec.message.value.url ?? '', error: R }) } }), sendFrame);
@@ -766,9 +807,14 @@ function handleStreaming(payload: CursorRequestPayload, accessToken: string, mod
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
 
     let closed = false;
-    const sse = (d: object) => { if (!closed) res.write(`data: ${JSON.stringify(d)}\n\n`); };
-    const done = () => { if (!closed) res.write('data: [DONE]\n\n'); };
-    const end = () => { if (closed) return; closed = true; res.end(); };
+    // A client that disconnects mid-stream destroys `res`; without these
+    // listeners the next res.write() raises an unhandled 'error' event and
+    // takes down the whole main process.
+    res.on('close', () => { closed = true; });
+    res.on('error', () => { closed = true; });
+    const sse = (d: object) => { if (!closed) try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch { closed = true; } };
+    const done = () => { if (!closed) try { res.write('data: [DONE]\n\n'); } catch { closed = true; } };
+    const end = () => { if (closed) return; closed = true; try { res.end(); } catch {} };
     const chunk = (delta: Record<string, unknown>, finish: string | null = null) => ({ id, object: 'chat.completion.chunk', created, model: modelId, choices: [{ index: 0, delta, finish_reason: finish }] });
 
     const state: StreamState = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
@@ -850,9 +896,12 @@ function resumeWithToolResults(session: ActiveSession, toolResults: ToolResultIn
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
 
     let closed = false;
-    const sse = (d: object) => { if (!closed) res.write(`data: ${JSON.stringify(d)}\n\n`); };
-    const done = () => { if (!closed) res.write('data: [DONE]\n\n'); };
-    const end = () => { if (closed) return; closed = true; res.end(); };
+    // Same disconnect guards as handleStreaming — see comment there.
+    res.on('close', () => { closed = true; });
+    res.on('error', () => { closed = true; });
+    const sse = (d: object) => { if (!closed) try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch { closed = true; } };
+    const done = () => { if (!closed) try { res.write('data: [DONE]\n\n'); } catch { closed = true; } };
+    const end = () => { if (closed) return; closed = true; try { res.end(); } catch {} };
     const chunk = (delta: Record<string, unknown>, finish: string | null = null) => ({ id, object: 'chat.completion.chunk', created, model: modelId, choices: [{ index: 0, delta, finish_reason: finish }] });
 
     const state: StreamState = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
@@ -890,10 +939,17 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
         try { h2Client.close(); } catch {}
     };
 
+    // Same disconnect guards as handleStreaming — see comment there. On a
+    // client disconnect, also tear down the h2 bridge and heartbeat so they
+    // don't keep running against a dead response.
+    res.on('error', () => {});
+    res.on('close', () => { if (!responded) { responded = true; cleanup(); } });
+
     const respond = (finishReason: 'stop' | 'tool_calls' | 'error', errMessage?: string) => {
         if (responded) return;
         responded = true;
         cleanup();
+        if (res.destroyed || res.headersSent) return;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         const message: Record<string, unknown> = { role: 'assistant', content: fullText || null };
         if (collectedToolCalls.length > 0) {
@@ -928,7 +984,10 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
                     payload.blobStore, payload.mcpTools,
                     (data) => { if (!h2Stream.closed && !h2Stream.destroyed) h2Stream.write(data); },
                     state,
-                    (text) => { fullText += text; },
+                    // Drop thinking deltas: non-streaming callers expect only the
+                    // final answer, and stray reasoning text (which often contains
+                    // braces) corrupts JSON extraction downstream.
+                    (text, isThinking) => { if (!isThinking) fullText += text; },
                     (exec) => {
                         // In non-streaming mode we cannot keep the bridge alive
                         // because there is no SSE to pause. Collect tool calls
@@ -957,4 +1016,14 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
         logger.error('Cursor proxy non-stream h2 error:', err);
         respond('error', err instanceof Error ? err.message : String(err));
     });
+
+    // Non-streaming callers (generateText) have no way to abort; if the
+    // bridge turn stalls, answer with whatever accumulated instead of
+    // hanging the caller and leaking the h2 session forever.
+    const turnDeadline = setTimeout(() => {
+        logger.warn('Cursor proxy non-stream turn exceeded 120s, responding with partial text');
+        respond('stop');
+    }, 120_000);
+    turnDeadline.unref?.();
+    res.on('close', () => clearTimeout(turnDeadline));
 }

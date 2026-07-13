@@ -4408,6 +4408,7 @@ var RequestContextSchema = /* @__PURE__ */ messageDesc(file_agent, 347);
 var SelectedImageSchema = /* @__PURE__ */ messageDesc(file_agent, 349);
 var SelectedContextSchema = /* @__PURE__ */ messageDesc(file_agent, 373);
 var ShellResultSchema = /* @__PURE__ */ messageDesc(file_agent, 389);
+var ShellStreamSchema = /* @__PURE__ */ messageDesc(file_agent, 395);
 var ShellRejectedSchema = /* @__PURE__ */ messageDesc(file_agent, 400);
 var WriteResultSchema = /* @__PURE__ */ messageDesc(file_agent, 450);
 var WriteRejectedSchema = /* @__PURE__ */ messageDesc(file_agent, 455);
@@ -4750,12 +4751,27 @@ ${effectiveUserText}`;
     }
   }
   const mcpTools = buildMcpToolDefinitions(tools);
-  const payload = buildCursorRequest(modelId, systemPrompt, effectiveUserText, images);
+  const isStreaming = body.stream === true;
+  const isUtilityCall = !isStreaming && mcpTools.length === 0;
+  const mode = isUtilityCall ? AGENT_MODE_ASK : undefined;
+  let promptSystem = systemPrompt;
+  let promptUser = effectiveUserText;
+  if (isUtilityCall && systemPrompt) {
+    promptUser = `<instructions>
+${systemPrompt}
+</instructions>
+
+${effectiveUserText}
+
+(Follow <instructions> exactly. Do NOT attempt to execute the task yourself — no tools.)`;
+    promptSystem = "";
+  }
+  const payload = buildCursorRequest(modelId, promptSystem, promptUser, images, mode);
   payload.mcpTools = mcpTools;
-  if (body.stream === false) {
-    handleNonStreaming(payload, accessToken, modelId, res, logger);
-  } else {
+  if (isStreaming) {
     handleStreaming(payload, accessToken, modelId, sessionKey, res);
+  } else {
+    handleNonStreaming(payload, accessToken, modelId, res, logger);
   }
 }
 function extractContent(content) {
@@ -4905,7 +4921,8 @@ function decodeMcpArgsMap(args) {
     decoded[key] = decodeMcpArgValue(value);
   return decoded;
 }
-function buildCursorRequest(modelId, systemPrompt, userText, images) {
+var AGENT_MODE_ASK = 2;
+function buildCursorRequest(modelId, systemPrompt, userText, images, mode) {
   const blobStore = new Map;
   const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
   const systemBytes = new TextEncoder().encode(systemJson);
@@ -4923,7 +4940,8 @@ function buildCursorRequest(modelId, systemPrompt, userText, images) {
     turnTimings: [],
     subagentStates: {},
     selfSummaryCount: 0,
-    readPaths: []
+    readPaths: [],
+    ...mode !== undefined && { mode }
   });
   const userMessage = create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() });
   if (images.length > 0) {
@@ -5005,7 +5023,7 @@ function handleKvMessage(kv, blobStore, sendFrame) {
 }
 function handleExecMessage(exec, mcpTools, sendFrame, onMcpExec) {
   const c = exec.message.case;
-  const R = "Tool not available in this environment. Use the MCP tools provided instead.";
+  const R = mcpTools.length > 0 ? "Tool not available in this environment. Use the MCP tools provided instead." : "Tool not available in this environment. Do not retry tools — answer directly in your final message.";
   if (c === "requestContextArgs") {
     const ctx = create(RequestContextSchema, { rules: [], repositoryInfo: [], tools: mcpTools, gitRepos: [], projectLayouts: [], mcpInstructions: [], fileContents: {}, customSubagents: [] });
     sendExec(exec, "requestContextResult", create(RequestContextResultSchema, { result: { case: "success", value: create(RequestContextSuccessSchema, { requestContext: ctx }) } }), sendFrame);
@@ -5022,9 +5040,12 @@ function handleExecMessage(exec, mcpTools, sendFrame, onMcpExec) {
     sendExec(exec, "writeResult", create(WriteResultSchema, { result: { case: "rejected", value: create(WriteRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
   else if (c === "deleteArgs")
     sendExec(exec, "deleteResult", create(DeleteResultSchema, { result: { case: "rejected", value: create(DeleteRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
-  else if (c === "shellArgs" || c === "shellStreamArgs") {
+  else if (c === "shellArgs") {
     const a = exec.message.value;
     sendExec(exec, "shellResult", create(ShellResultSchema, { result: { case: "rejected", value: create(ShellRejectedSchema, { command: a.command ?? "", workingDirectory: a.workingDirectory ?? "", reason: R, isReadonly: false }) } }), sendFrame);
+  } else if (c === "shellStreamArgs") {
+    const a = exec.message.value;
+    sendExec(exec, "shellStream", create(ShellStreamSchema, { event: { case: "rejected", value: create(ShellRejectedSchema, { command: a.command ?? "", workingDirectory: a.workingDirectory ?? "", reason: R, isReadonly: false }) } }), sendFrame);
   } else if (c === "backgroundShellSpawnArgs") {
     const a = exec.message.value;
     sendExec(exec, "backgroundShellSpawnResult", create(BackgroundShellSpawnResultSchema, { result: { case: "rejected", value: create(ShellRejectedSchema, { command: a.command ?? "", workingDirectory: a.workingDirectory ?? "", reason: R, isReadonly: false }) } }), sendFrame);
@@ -5053,23 +5074,39 @@ function handleStreaming(payload, accessToken, modelId, sessionKey, res) {
   const created = Math.floor(Date.now() / 1000);
   res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
   let closed = false;
+  res.on("close", () => {
+    closed = true;
+  });
+  res.on("error", () => {
+    closed = true;
+  });
   const sse = (d) => {
     if (!closed)
-      res.write(`data: ${JSON.stringify(d)}
+      try {
+        res.write(`data: ${JSON.stringify(d)}
 
 `);
+      } catch {
+        closed = true;
+      }
   };
   const done = () => {
     if (!closed)
-      res.write(`data: [DONE]
+      try {
+        res.write(`data: [DONE]
 
 `);
+      } catch {
+        closed = true;
+      }
   };
   const end = () => {
     if (closed)
       return;
     closed = true;
-    res.end();
+    try {
+      res.end();
+    } catch {}
   };
   const chunk = (delta, finish = null) => ({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta, finish_reason: finish }] });
   const state = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
@@ -5176,23 +5213,39 @@ function resumeWithToolResults(session, toolResults, modelId, sessionKey, res) {
   const created = Math.floor(Date.now() / 1000);
   res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
   let closed = false;
+  res.on("close", () => {
+    closed = true;
+  });
+  res.on("error", () => {
+    closed = true;
+  });
   const sse = (d) => {
     if (!closed)
-      res.write(`data: ${JSON.stringify(d)}
+      try {
+        res.write(`data: ${JSON.stringify(d)}
 
 `);
+      } catch {
+        closed = true;
+      }
   };
   const done = () => {
     if (!closed)
-      res.write(`data: [DONE]
+      try {
+        res.write(`data: [DONE]
 
 `);
+      } catch {
+        closed = true;
+      }
   };
   const end = () => {
     if (closed)
       return;
     closed = true;
-    res.end();
+    try {
+      res.end();
+    } catch {}
   };
   const chunk = (delta, finish = null) => ({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta, finish_reason: finish }] });
   const state = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
@@ -5247,11 +5300,20 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
       h2Client.close();
     } catch {}
   };
+  res.on("error", () => {});
+  res.on("close", () => {
+    if (!responded) {
+      responded = true;
+      cleanup();
+    }
+  });
   const respond = (finishReason, errMessage) => {
     if (responded)
       return;
     responded = true;
     cleanup();
+    if (res.destroyed || res.headersSent)
+      return;
     res.writeHead(200, { "Content-Type": "application/json" });
     const message = { role: "assistant", content: fullText || null };
     if (collectedToolCalls.length > 0) {
@@ -5289,8 +5351,9 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
         processServerMessage(fromBinary(AgentServerMessageSchema, messageBytes), payload.blobStore, payload.mcpTools, (data) => {
           if (!h2Stream.closed && !h2Stream.destroyed)
             h2Stream.write(data);
-        }, state, (text) => {
-          fullText += text;
+        }, state, (text, isThinking) => {
+          if (!isThinking)
+            fullText += text;
         }, (exec) => {
           collectedToolCalls.push({
             id: exec.toolCallId,
@@ -5313,6 +5376,12 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
     logger.error("Cursor proxy non-stream h2 error:", err);
     respond("error", err instanceof Error ? err.message : String(err));
   });
+  const turnDeadline = setTimeout(() => {
+    logger.warn("Cursor proxy non-stream turn exceeded 120s, responding with partial text");
+    respond("stop");
+  }, 120000);
+  turnDeadline.unref?.();
+  res.on("close", () => clearTimeout(turnDeadline));
 }
 
 // main.ts
