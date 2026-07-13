@@ -4433,10 +4433,226 @@ var FALLBACK_MODELS = [
 ];
 async function getCursorModels(apiKey) {
   const discovered = await fetchCursorUsableModels(apiKey);
-  return discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
+  if (discovered && discovered.length > 0) {
+    updateCatalog(discovered);
+    catalogListener?.(discovered);
+    return discovered;
+  }
+  return cachedCatalog.length > 0 ? cachedCatalog : FALLBACK_MODELS;
 }
 function getFallbackModels() {
-  return FALLBACK_MODELS;
+  return cachedCatalog.length > 0 ? cachedCatalog : FALLBACK_MODELS;
+}
+var cachedCatalog = [];
+var catalogListener;
+var variantGroups = new Map;
+function setCatalogListener(listener) {
+  catalogListener = listener;
+}
+function hydrateCatalog(models) {
+  if (!Array.isArray(models) || models.length === 0 || cachedCatalog.length > 0)
+    return;
+  const valid = models.filter((m) => m && typeof m.id === "string" && m.id.length > 0);
+  if (valid.length > 0)
+    updateCatalog(valid);
+}
+function updateCatalog(models) {
+  cachedCatalog = models;
+  variantGroups = buildVariantGroups(models);
+}
+var COMPOSER_LEVEL_ORDER = ["low", "medium", "high", "xhigh", "max", "ultra"];
+var EFFORT_SUFFIXES = [
+  ["extra-high", "xhigh"],
+  ["xhigh", "xhigh"],
+  ["minimal", "low"],
+  ["medium", "medium"],
+  ["ultra", "ultra"],
+  ["none", "none"],
+  ["high", "high"],
+  ["low", "low"],
+  ["max", "max"]
+];
+function parseVariantId(model) {
+  let rest = model.id;
+  let thinking = false;
+  let fast = false;
+  let effort;
+  for (;; ) {
+    if (!fast && rest.endsWith("-fast")) {
+      fast = true;
+      rest = rest.slice(0, -"-fast".length);
+      continue;
+    }
+    if (!thinking && rest.endsWith("-thinking")) {
+      thinking = true;
+      rest = rest.slice(0, -"-thinking".length);
+      continue;
+    }
+    if (effort === undefined) {
+      const match = EFFORT_SUFFIXES.find(([suffix]) => rest.endsWith(`-${suffix}`));
+      if (match) {
+        effort = match[1];
+        rest = rest.slice(0, -(match[0].length + 1));
+        continue;
+      }
+    }
+    break;
+  }
+  return { model, base: rest, thinking, fast, effort };
+}
+function buildVariantGroups(models) {
+  const byGroup = new Map;
+  for (const model of models) {
+    const info = parseVariantId(model);
+    const key = `${info.base}${info.fast ? "\x00fast" : ""}`;
+    const list = byGroup.get(key);
+    if (list)
+      list.push(info);
+    else
+      byGroup.set(key, [info]);
+  }
+  const groups = new Map;
+  for (const members of byGroup.values()) {
+    if (members.length < 2)
+      continue;
+    const { base, fast } = members[0];
+    const bareBase = members.find((m) => !m.thinking && !m.fast && m.effort === undefined && m.model.id === base);
+    const collapsedId = bareBase ? base : fast ? `${base}-fast` : base;
+    const nonThinking = members.filter((m) => !m.thinking);
+    const namePool = nonThinking.length > 0 ? nonThinking : members;
+    const defaultMember = pickDefaultMember(namePool);
+    const offMember = nonThinking.find((m) => m.effort === "none") ?? defaultMember;
+    const thinkingMembers = members.filter((m) => m.thinking);
+    const effortPool = thinkingMembers.length > 0 ? thinkingMembers : nonThinking;
+    const byEffort = new Map;
+    for (const m of effortPool) {
+      if (m.effort && m.effort !== "none" && !byEffort.has(m.effort)) {
+        byEffort.set(m.effort, m.model.id);
+      }
+    }
+    const thinkingDefaultId = thinkingMembers.find((m) => m.effort === undefined)?.model.id;
+    groups.set(collapsedId, {
+      id: collapsedId,
+      members,
+      defaultId: defaultMember.model.id,
+      offId: offMember.model.id,
+      byEffort,
+      thinkingDefaultId
+    });
+  }
+  return groups;
+}
+var EFFORT_DISPLAY_WORDS = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra High",
+  max: "Max",
+  none: "None",
+  ultra: "Ultra"
+};
+function nameCarriesOwnEffort(member) {
+  if (!member.effort)
+    return false;
+  const word = EFFORT_DISPLAY_WORDS[member.effort];
+  if (!word)
+    return false;
+  return new RegExp(`\\b${word}\\b`, "i").test(member.model.name);
+}
+var DEFAULT_EFFORT_PREFERENCE = ["medium", "high", "low", "xhigh", "max", "none"];
+function pickDefaultMember(pool) {
+  const unmarked = pool.filter((m) => !nameCarriesOwnEffort(m));
+  if (unmarked.length > 0) {
+    return unmarked.reduce((a, b) => b.model.name.length < a.model.name.length ? b : a);
+  }
+  for (const effort of DEFAULT_EFFORT_PREFERENCE) {
+    const match = pool.find((m) => m.effort === effort);
+    if (match)
+      return match;
+  }
+  return pool.reduce((a, b) => b.model.name.length < a.model.name.length ? b : a);
+}
+function collapsedDisplayName(member) {
+  if (!nameCarriesOwnEffort(member))
+    return member.model.name;
+  const word = EFFORT_DISPLAY_WORDS[member.effort];
+  return member.model.name.replace(new RegExp(`\\s*\\b${word}\\b`, "i"), "").replace(/\s{2,}/g, " ").trim();
+}
+function collapseCursorModels(models) {
+  const groups = buildVariantGroups(models);
+  const groupByMemberId = new Map;
+  for (const group of groups.values()) {
+    for (const m of group.members)
+      groupByMemberId.set(m.model.id, group);
+  }
+  const collapsed = [];
+  const emitted = new Set;
+  for (const model of models) {
+    const group = groupByMemberId.get(model.id);
+    if (!group) {
+      collapsed.push({ ...model, variantCount: 1 });
+      continue;
+    }
+    if (emitted.has(group.id))
+      continue;
+    emitted.add(group.id);
+    const defaultMember = group.members.find((m) => m.model.id === group.defaultId);
+    const levels = COMPOSER_LEVEL_ORDER.filter((l) => group.byEffort.has(l));
+    collapsed.push({
+      id: group.id,
+      name: collapsedDisplayName(defaultMember),
+      reasoning: group.members.some((m) => m.thinking) || levels.length > 0 || group.members.some((m) => m.model.reasoning),
+      contextWindow: Math.max(...group.members.map((m) => m.model.contextWindow)),
+      maxTokens: Math.max(...group.members.map((m) => m.model.maxTokens)),
+      reasoningLevels: levels.length > 0 ? levels : undefined,
+      variantCount: group.members.length
+    });
+  }
+  return collapsed;
+}
+function resolveCursorModelId(modelId, reasoningEffort) {
+  const group = variantGroups.get(modelId);
+  if (!group)
+    return modelId;
+  const effort = normalizeEffort(reasoningEffort);
+  if (effort === undefined)
+    return group.defaultId;
+  if (effort === "off")
+    return group.offId;
+  const exact = group.byEffort.get(effort);
+  if (exact)
+    return exact;
+  const nearest = nearestLevel(effort, [...group.byEffort.keys()]);
+  if (nearest)
+    return group.byEffort.get(nearest);
+  return group.thinkingDefaultId ?? group.defaultId;
+}
+function normalizeEffort(effort) {
+  if (typeof effort !== "string" || effort.length === 0)
+    return;
+  const lower = effort.toLowerCase();
+  if (lower === "off" || lower === "none")
+    return "off";
+  if (lower === "minimal")
+    return "low";
+  if (lower === "extra-high")
+    return "xhigh";
+  return COMPOSER_LEVEL_ORDER.includes(lower) ? lower : undefined;
+}
+function nearestLevel(target, available) {
+  const targetIdx = COMPOSER_LEVEL_ORDER.indexOf(target);
+  let best;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const level of COMPOSER_LEVEL_ORDER) {
+    if (!available.includes(level))
+      continue;
+    const distance = Math.abs(COMPOSER_LEVEL_ORDER.indexOf(level) - targetIdx);
+    if (distance < bestDistance) {
+      best = level;
+      bestDistance = distance;
+    }
+  }
+  return best;
 }
 async function fetchCursorUsableModels(apiKey) {
   try {
@@ -4602,9 +4818,6 @@ function destroySession(session) {
   try {
     session.h2Stream.close();
   } catch {}
-  try {
-    session.h2Client.close();
-  } catch {}
 }
 function gcStaleSessions() {
   const now = Date.now();
@@ -4677,6 +4890,7 @@ function stopProxy() {
     destroySession(session);
     activeSessions.delete(key);
   }
+  dropSharedH2Session();
 }
 function createProxyFetch() {
   return async (input, init) => {
@@ -4704,7 +4918,10 @@ function readBody(req) {
 }
 function handleChatCompletion(body, accessToken, res, logger) {
   const { systemPrompt, userText, images, turns, toolResults } = parseMessages(body.messages);
-  const modelId = body.model;
+  const modelId = resolveCursorModelId(body.model, body.reasoning_effort);
+  if (modelId !== body.model) {
+    logger.debug(`Cursor proxy: resolved ${body.model} (effort=${body.reasoning_effort ?? "default"}) -> ${modelId}`);
+  }
   const tools = body.tools ?? [];
   if (!userText && toolResults.length === 0) {
     res.writeHead(400, { "Content-Type": "application/json" });
@@ -5025,10 +5242,52 @@ function formatConnectError(error) {
 function makeHeartbeatBytes() {
   return frameConnectMessage(toBinary(AgentClientMessageSchema, create(AgentClientMessageSchema, { message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) } })));
 }
-function createH2Stream(accessToken) {
-  const client = http22.connect(CURSOR_API_URL);
-  client.on("error", () => {});
-  const stream = client.request({
+var sharedH2Session;
+var sharedH2KeepAlive;
+function dropSharedH2Session() {
+  if (sharedH2KeepAlive) {
+    clearInterval(sharedH2KeepAlive);
+    sharedH2KeepAlive = undefined;
+  }
+  const s = sharedH2Session;
+  sharedH2Session = undefined;
+  if (s) {
+    try {
+      s.close();
+    } catch {}
+  }
+}
+function getSharedH2Session() {
+  if (sharedH2Session && !sharedH2Session.closed && !sharedH2Session.destroyed) {
+    return sharedH2Session;
+  }
+  if (sharedH2Session)
+    dropSharedH2Session();
+  const session = http22.connect(CURSOR_API_URL);
+  sharedH2Session = session;
+  const forget = () => {
+    if (sharedH2Session === session)
+      dropSharedH2Session();
+  };
+  session.on("error", forget);
+  session.on("close", forget);
+  session.on("goaway", forget);
+  sharedH2KeepAlive = setInterval(() => {
+    if (session.closed || session.destroyed) {
+      forget();
+      return;
+    }
+    try {
+      session.ping(() => {});
+    } catch {
+      forget();
+    }
+  }, 30000);
+  sharedH2KeepAlive.unref?.();
+  return session;
+}
+function openH2Stream(session, accessToken) {
+  return session.request({
     ":method": "POST",
     ":path": "/agent.v1.AgentService/Run",
     "content-type": "application/connect+proto",
@@ -5040,7 +5299,16 @@ function createH2Stream(accessToken) {
     "x-cursor-client-type": "cli",
     "x-request-id": crypto.randomUUID()
   });
-  return { client, stream };
+}
+function createH2Stream(accessToken) {
+  let session = getSharedH2Session();
+  try {
+    return { client: session, stream: openH2Stream(session, accessToken) };
+  } catch {
+    dropSharedH2Session();
+    session = getSharedH2Session();
+    return { client: session, stream: openH2Stream(session, accessToken) };
+  }
 }
 function processServerMessage(msg, blobStore, mcpTools, sendFrame, state, onText, onMcpExec) {
   const c = msg.message.case;
@@ -5168,7 +5436,6 @@ function handleStreaming(payload, accessToken, modelId, sessionKey, res) {
   h2Stream.on("data", processData);
   h2Stream.on("end", () => {
     clearInterval(heartbeatTimer);
-    h2Client.close();
     if (!mcpExecReceived) {
       if (state.thinkingActive)
         sse(chunk({ content: "</think>" }));
@@ -5180,7 +5447,7 @@ function handleStreaming(payload, accessToken, modelId, sessionKey, res) {
   h2Stream.on("error", () => {
     clearInterval(heartbeatTimer);
     try {
-      h2Client.close();
+      h2Stream.close();
     } catch {}
     if (!mcpExecReceived) {
       sse(chunk({}, "stop"));
@@ -5301,7 +5568,6 @@ function resumeWithToolResults(session, toolResults, modelId, sessionKey, res) {
   h2Stream.on("data", processData);
   h2Stream.on("end", () => {
     clearInterval(heartbeatTimer);
-    h2Client.close();
     if (!mcpExecReceived) {
       if (state.thinkingActive)
         sse(chunk({ content: "</think>" }));
@@ -5313,7 +5579,7 @@ function resumeWithToolResults(session, toolResults, modelId, sessionKey, res) {
   h2Stream.on("error", () => {
     clearInterval(heartbeatTimer);
     try {
-      h2Client.close();
+      h2Stream.close();
     } catch {}
     if (!mcpExecReceived) {
       sse(chunk({}, "stop"));
@@ -5341,9 +5607,6 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
     clearInterval(heartbeatTimer);
     try {
       h2Stream.close();
-    } catch {}
-    try {
-      h2Client.close();
     } catch {}
   };
   res.on("error", () => {});
@@ -5440,11 +5703,55 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
 
 // main.ts
 var DUMMY_API_KEY = "cursor-proxy";
+var MODELS_CACHE_KEY = "cursor-model-catalog-v1";
 async function activate(context) {
   const { logger, storage, providers, commands, ui } = context;
   logger.info("Cursor Auth plugin activating...");
   const tokenStore = new TokenStore(storage.secrets, logger);
   await tokenStore.initialize();
+  setCatalogListener((models) => {
+    storage.local.set(MODELS_CACHE_KEY, models).catch((err) => logger.warn("Failed to persist Cursor model catalog:", err));
+  });
+  const catalogHydration = (async () => {
+    try {
+      const persisted = await storage.local.get(MODELS_CACHE_KEY);
+      hydrateCatalog(persisted);
+      if (Array.isArray(persisted) && persisted.length > 0) {
+        logger.info(`Hydrated ${persisted.length} Cursor models from storage`);
+      }
+    } catch (err) {
+      logger.warn("Failed to hydrate Cursor model catalog from storage:", err);
+    }
+  })();
+  const toProviderModels = (models) => collapseCursorModels(models).map((model) => ({
+    id: model.id,
+    name: model.name,
+    description: model.variantCount > 1 ? `Cursor: ${model.name} — ${model.variantCount} effort variants merged; the thinking selector picks the tier` : `Cursor: ${model.name}${model.reasoning ? " (reasoning)" : ""}`,
+    contextWindow: model.contextWindow,
+    maxOutputTokens: model.maxTokens,
+    capabilities: {
+      temperature: true,
+      streaming: true,
+      reasoning: model.reasoning,
+      attachment: false,
+      functionCalling: true,
+      ...model.reasoningLevels ? { reasoningLevels: model.reasoningLevels } : {},
+      input: {
+        text: true,
+        audio: false,
+        image: true,
+        video: false,
+        pdf: false
+      },
+      output: {
+        text: true,
+        audio: false,
+        image: false,
+        video: false,
+        pdf: false
+      }
+    }
+  }));
   let currentProxyPort;
   const ensureProxy = async () => {
     if (currentProxyPort)
@@ -5493,77 +5800,27 @@ async function activate(context) {
       logger.info("Cursor logout successful");
     },
     async getModels() {
+      await catalogHydration;
       const tokens = tokenStore.getTokens();
       const models = tokens ? await getCursorModels(tokens.access_token).catch(() => getFallbackModels()) : getFallbackModels();
-      return models.map((model) => ({
-        id: model.id,
-        name: model.name,
-        description: `Cursor: ${model.name}${model.reasoning ? " (reasoning)" : ""}`,
-        contextWindow: model.contextWindow,
-        maxOutputTokens: model.maxTokens,
-        capabilities: {
-          temperature: true,
-          streaming: true,
-          reasoning: model.reasoning,
-          attachment: false,
-          functionCalling: true,
-          input: {
-            text: true,
-            audio: false,
-            image: true,
-            video: false,
-            pdf: false
-          },
-          output: {
-            text: true,
-            audio: false,
-            image: false,
-            video: false,
-            pdf: false
-          }
-        }
-      }));
+      return toProviderModels(models);
     },
     async fetchModels() {
       logger.info("Fetching available models from Cursor API...");
       try {
+        await catalogHydration;
         const accessToken = await tokenStore.getValidAccessToken();
         const models = await getCursorModels(accessToken);
-        logger.info(`Fetched ${models.length} models from Cursor API`);
-        return models.map((model) => ({
-          id: model.id,
-          name: model.name,
-          description: `Cursor: ${model.name}${model.reasoning ? " (reasoning)" : ""}`,
-          contextWindow: model.contextWindow,
-          maxOutputTokens: model.maxTokens,
-          capabilities: {
-            temperature: true,
-            streaming: true,
-            reasoning: model.reasoning,
-            attachment: false,
-            functionCalling: true,
-            input: {
-              text: true,
-              audio: false,
-              image: false,
-              video: false,
-              pdf: false
-            },
-            output: {
-              text: true,
-              audio: false,
-              image: false,
-              video: false,
-              pdf: false
-            }
-          }
-        }));
+        const collapsed = toProviderModels(models);
+        logger.info(`Fetched ${models.length} models from Cursor API (collapsed to ${collapsed.length} picker entries)`);
+        return collapsed;
       } catch (error) {
         logger.error("Error fetching models:", error);
         return this.getModels();
       }
     },
     async getSDKConfig() {
+      await catalogHydration;
       const port = await ensureProxy();
       return {
         apiKey: DUMMY_API_KEY,

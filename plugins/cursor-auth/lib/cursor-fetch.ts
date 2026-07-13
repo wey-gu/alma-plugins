@@ -87,6 +87,7 @@ import type {
     StreamState,
     ToolResultInfo,
 } from './types';
+import { resolveCursorModelId } from './models';
 
 const CURSOR_API_URL = 'https://api2.cursor.sh';
 const CURSOR_CLIENT_VERSION = 'cli-2026.02.13-41ac335';
@@ -121,8 +122,9 @@ const SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 function destroySession(session: ActiveSession): void {
     clearInterval(session.heartbeatTimer);
+    // Close only the per-turn stream, never the underlying h2 session — it is
+    // shared and reused across requests (see getSharedH2Session).
     try { session.h2Stream.close(); } catch {}
-    try { session.h2Client.close(); } catch {}
 }
 
 function gcStaleSessions(): void {
@@ -222,6 +224,7 @@ export function stopProxy(): void {
         destroySession(session);
         activeSessions.delete(key);
     }
+    dropSharedH2Session();
 }
 
 /**
@@ -271,7 +274,12 @@ function handleChatCompletion(
     logger: Logger,
 ): void {
     const { systemPrompt, userText, images, turns, toolResults } = parseMessages(body.messages);
-    const modelId = body.model;
+    // Collapsed picker ids (e.g. claude-fable-5) are not real backend slugs —
+    // resolve them to the concrete variant using the composer's thinking level.
+    const modelId = resolveCursorModelId(body.model, body.reasoning_effort);
+    if (modelId !== body.model) {
+        logger.debug(`Cursor proxy: resolved ${body.model} (effort=${body.reasoning_effort ?? 'default'}) -> ${modelId}`);
+    }
     const tools = body.tools ?? [];
 
     if (!userText && toolResults.length === 0) {
@@ -767,17 +775,66 @@ function makeHeartbeatBytes(): Buffer {
 // HTTP/2 Stream
 // ============================================================================
 
-function createH2Stream(accessToken: string): { client: http2.ClientHttp2Session; stream: http2.ClientHttp2Stream } {
-    const client = http2.connect(CURSOR_API_URL);
-    client.on('error', () => {});
-    const stream = client.request({
+// ---- Shared HTTP/2 session (connection reuse) ----
+// A fresh TLS+HTTP/2 connection to api2.cursor.sh costs ~1.1s of handshake and
+// was previously paid on EVERY chat message. HTTP/2 multiplexes many streams
+// over one session, so we keep a single warm session and open a cheap stream
+// per request. A periodic PING keeps it alive across idle; any error/close/
+// goaway drops the cached session so the next request lazily reconnects. Auth
+// is per-stream (Bearer header on request()), so token refresh is unaffected.
+let sharedH2Session: http2.ClientHttp2Session | undefined;
+let sharedH2KeepAlive: NodeJS.Timeout | undefined;
+
+function dropSharedH2Session(): void {
+    if (sharedH2KeepAlive) { clearInterval(sharedH2KeepAlive); sharedH2KeepAlive = undefined; }
+    const s = sharedH2Session;
+    sharedH2Session = undefined;
+    if (s) { try { s.close(); } catch {} }
+}
+
+function getSharedH2Session(): http2.ClientHttp2Session {
+    if (sharedH2Session && !sharedH2Session.closed && !sharedH2Session.destroyed) {
+        return sharedH2Session;
+    }
+    if (sharedH2Session) dropSharedH2Session();
+
+    const session = http2.connect(CURSOR_API_URL);
+    sharedH2Session = session;
+    // Swallow transport errors but forget the session so the next call reconnects.
+    const forget = () => { if (sharedH2Session === session) dropSharedH2Session(); };
+    session.on('error', forget);
+    session.on('close', forget);
+    session.on('goaway', forget);
+
+    sharedH2KeepAlive = setInterval(() => {
+        if (session.closed || session.destroyed) { forget(); return; }
+        try { session.ping(() => {}); } catch { forget(); }
+    }, 30_000);
+    sharedH2KeepAlive.unref?.();
+
+    return session;
+}
+
+function openH2Stream(session: http2.ClientHttp2Session, accessToken: string): http2.ClientHttp2Stream {
+    return session.request({
         ':method': 'POST', ':path': '/agent.v1.AgentService/Run',
         'content-type': 'application/connect+proto', 'connect-protocol-version': '1',
         'te': 'trailers', 'authorization': `Bearer ${accessToken}`,
         'x-ghost-mode': 'true', 'x-cursor-client-version': CURSOR_CLIENT_VERSION,
         'x-cursor-client-type': 'cli', 'x-request-id': crypto.randomUUID(),
     });
-    return { client, stream };
+}
+
+function createH2Stream(accessToken: string): { client: http2.ClientHttp2Session; stream: http2.ClientHttp2Stream } {
+    let session = getSharedH2Session();
+    try {
+        return { client: session, stream: openH2Stream(session, accessToken) };
+    } catch {
+        // Session died between the health check and request() — reconnect once.
+        dropSharedH2Session();
+        session = getSharedH2Session();
+        return { client: session, stream: openH2Stream(session, accessToken) };
+    }
 }
 
 // ============================================================================
@@ -882,8 +939,9 @@ function handleStreaming(payload: CursorRequestPayload, accessToken: string, mod
     const processData = buildStreamProcessor(h2Stream, payload, state, chunk, sse, done, end, h2Client, heartbeatTimer, sessionKey, () => { mcpExecReceived = true; });
 
     h2Stream.on('data', processData);
-    h2Stream.on('end', () => { clearInterval(heartbeatTimer); h2Client.close(); if (!mcpExecReceived) { if (state.thinkingActive) sse(chunk({ content: '</think>' })); sse(chunk({}, 'stop')); done(); end(); } });
-    h2Stream.on('error', () => { clearInterval(heartbeatTimer); try { h2Client.close(); } catch {} if (!mcpExecReceived) { sse(chunk({}, 'stop')); done(); end(); } });
+    // Close only the finished/errored stream; the h2 session is shared and stays warm.
+    h2Stream.on('end', () => { clearInterval(heartbeatTimer); if (!mcpExecReceived) { if (state.thinkingActive) sse(chunk({ content: '</think>' })); sse(chunk({}, 'stop')); done(); end(); } });
+    h2Stream.on('error', () => { clearInterval(heartbeatTimer); try { h2Stream.close(); } catch {} if (!mcpExecReceived) { sse(chunk({}, 'stop')); done(); end(); } });
 }
 
 function buildStreamProcessor(
@@ -964,8 +1022,9 @@ function resumeWithToolResults(session: ActiveSession, toolResults: ToolResultIn
     const processData = buildStreamProcessor(h2Stream, { blobStore, mcpTools }, state, chunk, sse, done, end, h2Client, heartbeatTimer, sessionKey, () => { mcpExecReceived = true; });
 
     h2Stream.on('data', processData);
-    h2Stream.on('end', () => { clearInterval(heartbeatTimer); h2Client.close(); if (!mcpExecReceived) { if (state.thinkingActive) sse(chunk({ content: '</think>' })); sse(chunk({}, 'stop')); done(); end(); } });
-    h2Stream.on('error', () => { clearInterval(heartbeatTimer); try { h2Client.close(); } catch {} if (!mcpExecReceived) { sse(chunk({}, 'stop')); done(); end(); } });
+    // Close only the finished/errored stream; the h2 session is shared and stays warm.
+    h2Stream.on('end', () => { clearInterval(heartbeatTimer); if (!mcpExecReceived) { if (state.thinkingActive) sse(chunk({ content: '</think>' })); sse(chunk({}, 'stop')); done(); end(); } });
+    h2Stream.on('error', () => { clearInterval(heartbeatTimer); try { h2Stream.close(); } catch {} if (!mcpExecReceived) { sse(chunk({}, 'stop')); done(); end(); } });
 }
 
 // ============================================================================
@@ -990,8 +1049,8 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
 
     const cleanup = () => {
         clearInterval(heartbeatTimer);
+        // Close only the stream; the h2 session is shared and stays warm.
         try { h2Stream.close(); } catch {}
-        try { h2Client.close(); } catch {}
     };
 
     // Same disconnect guards as handleStreaming — see comment there. On a
