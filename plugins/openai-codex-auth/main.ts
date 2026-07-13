@@ -119,22 +119,32 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             fullText += decoder.decode(value, { stream: true });
         }
 
-        // Parse SSE events to extract the final response
+        // Parse SSE events to extract the final response.
+        // The ChatGPT Codex backend (observed live 2026-07-13 with gpt-5.5 and
+        // gpt-5.6-*) emits `response.completed` with an EMPTY `output` array —
+        // the real items only arrive via `response.output_item.done` events.
+        // Collect those as a fallback so the answer isn't silently dropped.
         const lines = fullText.split('\n');
-        let finalResponse: unknown = null;
+        let finalResponse: { output?: unknown[] } | null = null;
+        const doneItems: unknown[] = [];
 
         for (const line of lines) {
             if (line.startsWith('data: ')) {
                 try {
                     const data = JSON.parse(line.substring(6));
-                    if (data.type === 'response.done' || data.type === 'response.completed') {
+                    if (data.type === 'response.output_item.done' && data.item) {
+                        doneItems.push(data.item);
+                    } else if (data.type === 'response.done' || data.type === 'response.completed') {
                         finalResponse = data.response;
-                        break;
                     }
                 } catch {
                     // Skip malformed JSON
                 }
             }
+        }
+
+        if (finalResponse && doneItems.length > 0 && (!Array.isArray(finalResponse.output) || finalResponse.output.length === 0)) {
+            finalResponse.output = doneItems;
         }
 
         if (!finalResponse) {
