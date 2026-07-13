@@ -555,13 +555,36 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 // MCP Tool Definitions
 // ============================================================================
 
+// Cursor's Fable-5 agent harness registers internal tools with these names;
+// a client MCP tool with the same name collides upstream and the whole turn
+// dies with resource_exhausted "Provider Error — We're having trouble
+// connecting to the model provider" (verified 2026-07-13 by probing every
+// Claude-native tool name against claude-fable-5-thinking-medium; other
+// models like claude-4.5-sonnet don't collide). Registered names get an
+// alma_ prefix and are decoded back when the server asks to execute them.
+const CURSOR_RESERVED_TOOL_NAMES = new Set([
+    'Task', 'TodoWrite', 'Read', 'Write', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
+]);
+const RESERVED_TOOL_PREFIX = 'alma_';
+
+function encodeToolName(name: string): string {
+    return CURSOR_RESERVED_TOOL_NAMES.has(name) ? RESERVED_TOOL_PREFIX + name : name;
+}
+
+function decodeToolName(name: string): string {
+    if (!name.startsWith(RESERVED_TOOL_PREFIX)) return name;
+    const stripped = name.slice(RESERVED_TOOL_PREFIX.length);
+    return CURSOR_RESERVED_TOOL_NAMES.has(stripped) ? stripped : name;
+}
+
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
     return tools.map((t) => {
         const fn = t.function;
         const jsonSchema: JsonValue = fn.parameters && typeof fn.parameters === 'object'
             ? (fn.parameters as JsonValue) : { type: 'object', properties: {}, required: [] };
         const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, jsonSchema));
-        return create(McpToolDefinitionSchema, { name: fn.name, description: fn.description || '', providerIdentifier: 'alma', toolName: fn.name, inputSchema });
+        const wireName = encodeToolName(fn.name);
+        return create(McpToolDefinitionSchema, { name: wireName, description: fn.description || '', providerIdentifier: 'alma', toolName: wireName, inputSchema });
     });
 }
 
@@ -798,7 +821,7 @@ function handleExecMessage(exec: ExecServerMessage, mcpTools: McpToolDefinition[
         sendExec(exec, 'requestContextResult', create(RequestContextResultSchema, { result: { case: 'success', value: create(RequestContextSuccessSchema, { requestContext: ctx }) } }), sendFrame);
     } else if (c === 'mcpArgs') {
         const a = exec.message.value;
-        onMcpExec({ execId: exec.execId, execMsgId: exec.id, toolCallId: a.toolCallId || crypto.randomUUID(), toolName: a.toolName || a.name, decodedArgs: JSON.stringify(decodeMcpArgsMap(a.args ?? {})) });
+        onMcpExec({ execId: exec.execId, execMsgId: exec.id, toolCallId: a.toolCallId || crypto.randomUUID(), toolName: decodeToolName(a.toolName || a.name), decodedArgs: JSON.stringify(decodeMcpArgsMap(a.args ?? {})) });
     } else if (c === 'readArgs') sendExec(exec, 'readResult', create(ReadResultSchema, { result: { case: 'rejected', value: create(ReadRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
     else if (c === 'lsArgs') sendExec(exec, 'lsResult', create(LsResultSchema, { result: { case: 'rejected', value: create(LsRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
     else if (c === 'grepArgs') sendExec(exec, 'grepResult', create(GrepResultSchema, { result: { case: 'error', value: create(GrepErrorSchema, { error: R }) } }), sendFrame);
