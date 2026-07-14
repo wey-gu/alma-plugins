@@ -4811,6 +4811,25 @@ var CURSOR_API_URL = "https://api2.cursor.sh";
 var CURSOR_CLIENT_VERSION2 = "cli-2026.02.13-41ac335";
 var CONNECT_END_STREAM_FLAG = 2;
 var activeSessions = new Map;
+function registerBridge(bridge, keys) {
+  bridge.keys = keys;
+  for (const k of keys)
+    activeSessions.set(k, bridge);
+}
+function deleteBridge(bridge) {
+  for (const k of bridge.keys) {
+    if (activeSessions.get(k) === bridge)
+      activeSessions.delete(k);
+  }
+}
+function bridgeKeysFor(sessionKey, execs) {
+  const keys = [sessionKey];
+  for (const e of execs) {
+    if (e.toolCallId)
+      keys.push(`tc:${e.toolCallId}`);
+  }
+  return keys;
+}
 var sessionGcTimer;
 var SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 function destroySession(session) {
@@ -4821,10 +4840,10 @@ function destroySession(session) {
 }
 function gcStaleSessions() {
   const now = Date.now();
-  for (const [key, session] of activeSessions) {
+  for (const session of new Set(activeSessions.values())) {
     if (now - session.lastActiveAt > SESSION_IDLE_TIMEOUT_MS) {
       destroySession(session);
-      activeSessions.delete(key);
+      deleteBridge(session);
     }
   }
 }
@@ -4886,10 +4905,10 @@ function stopProxy() {
     clearInterval(sessionGcTimer);
     sessionGcTimer = undefined;
   }
-  for (const [key, session] of activeSessions) {
+  for (const session of new Set(activeSessions.values())) {
     destroySession(session);
-    activeSessions.delete(key);
   }
+  activeSessions.clear();
   dropSharedH2Session();
 }
 function createProxyFetch() {
@@ -4929,15 +4948,26 @@ function handleChatCompletion(body, accessToken, res, logger) {
     return;
   }
   const sessionKey = deriveSessionKey(modelId, body.messages);
-  const activeSession = activeSessions.get(sessionKey);
+  let activeSession;
+  for (const r of toolResults) {
+    if (!r.toolCallId)
+      continue;
+    const b = activeSessions.get(`tc:${r.toolCallId}`);
+    if (b) {
+      activeSession = b;
+      break;
+    }
+  }
+  if (!activeSession)
+    activeSession = activeSessions.get(sessionKey);
   if (activeSession && toolResults.length > 0) {
-    activeSessions.delete(sessionKey);
+    deleteBridge(activeSession);
     resumeWithToolResults(activeSession, toolResults, modelId, sessionKey, res);
     return;
   }
   if (activeSession) {
     destroySession(activeSession);
-    activeSessions.delete(sessionKey);
+    deleteBridge(activeSession);
   }
   let effectiveUserText = userText;
   if (!effectiveUserText && toolResults.length > 0) {
@@ -5500,7 +5530,8 @@ function buildStreamProcessor(h2Stream, payload, state, chunk, sse, done, end, h
             state.thinkingActive = false;
           }
           sse(chunk({ tool_calls: [{ index: state.toolCallIndex++, id: exec.toolCallId, type: "function", function: { name: exec.toolName, arguments: exec.decodedArgs } }] }));
-          activeSessions.set(sessionKey, { h2Client, h2Stream, heartbeatTimer, blobStore: payload.blobStore, mcpTools: payload.mcpTools, pendingExecs: state.pendingExecs, lastActiveAt: Date.now() });
+          const bridge = { h2Client, h2Stream, heartbeatTimer, blobStore: payload.blobStore, mcpTools: payload.mcpTools, pendingExecs: state.pendingExecs, lastActiveAt: Date.now(), keys: [] };
+          registerBridge(bridge, bridgeKeysFor(sessionKey, state.pendingExecs));
           sse(chunk({}, "tool_calls"));
           done();
           end();

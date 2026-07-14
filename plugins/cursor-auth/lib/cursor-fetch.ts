@@ -112,9 +112,35 @@ interface ActiveSession {
     pendingExecs: PendingExec[];
     /** Last time this session was created or refreshed. */
     lastActiveAt: number;
+    /** Every activeSessions map key this bridge is registered under (see registerBridge). */
+    keys: string[];
 }
 
+// Bridges are keyed primarily by `tc:<toolCallId>` — tool call ids are globally
+// unique, so two parallel conversations never collide even if their opening
+// messages are byte-identical. A content-derived key is also registered as a
+// fallback for the pre-tool-call cleanup path. registerBridge stores a bridge
+// under all its keys and records them so deleteBridge can remove every one.
 const activeSessions = new Map<string, ActiveSession>();
+
+function registerBridge(bridge: ActiveSession, keys: string[]): void {
+    bridge.keys = keys;
+    for (const k of keys) activeSessions.set(k, bridge);
+}
+
+function deleteBridge(bridge: ActiveSession): void {
+    for (const k of bridge.keys) {
+        if (activeSessions.get(k) === bridge) activeSessions.delete(k);
+    }
+}
+
+function bridgeKeysFor(sessionKey: string, execs: PendingExec[]): string[] {
+    const keys = [sessionKey];
+    for (const e of execs) {
+        if (e.toolCallId) keys.push(`tc:${e.toolCallId}`);
+    }
+    return keys;
+}
 let sessionGcTimer: NodeJS.Timeout | undefined;
 
 /** Idle bridge timeout: if a tool result hasn't arrived in this window the bridge is GC'd. */
@@ -129,10 +155,10 @@ function destroySession(session: ActiveSession): void {
 
 function gcStaleSessions(): void {
     const now = Date.now();
-    for (const [key, session] of activeSessions) {
+    for (const session of new Set(activeSessions.values())) {
         if (now - session.lastActiveAt > SESSION_IDLE_TIMEOUT_MS) {
             destroySession(session);
-            activeSessions.delete(key);
+            deleteBridge(session);
         }
     }
 }
@@ -220,10 +246,10 @@ export function stopProxy(): void {
         clearInterval(sessionGcTimer);
         sessionGcTimer = undefined;
     }
-    for (const [key, session] of activeSessions) {
+    for (const session of new Set(activeSessions.values())) {
         destroySession(session);
-        activeSessions.delete(key);
     }
+    activeSessions.clear();
     dropSharedH2Session();
 }
 
@@ -289,17 +315,25 @@ function handleChatCompletion(
     }
 
     const sessionKey = deriveSessionKey(modelId, body.messages);
-    const activeSession = activeSessions.get(sessionKey);
+    // Resume prefers an exact tool-call-id match (collision-proof across parallel
+    // conversations); the content-derived key is only a fallback.
+    let activeSession: ActiveSession | undefined;
+    for (const r of toolResults) {
+        if (!r.toolCallId) continue;
+        const b = activeSessions.get(`tc:${r.toolCallId}`);
+        if (b) { activeSession = b; break; }
+    }
+    if (!activeSession) activeSession = activeSessions.get(sessionKey);
 
     if (activeSession && toolResults.length > 0) {
-        activeSessions.delete(sessionKey);
+        deleteBridge(activeSession);
         resumeWithToolResults(activeSession, toolResults, modelId, sessionKey, res);
         return;
     }
 
     if (activeSession) {
         destroySession(activeSession);
-        activeSessions.delete(sessionKey);
+        deleteBridge(activeSession);
     }
 
     // Bridge died but caller is sending tool results: rebuild the conversation
@@ -974,7 +1008,8 @@ function buildStreamProcessor(
                         state.pendingExecs.push(exec); onMcpFlag();
                         if (state.thinkingActive) { sse(chunk({ content: '</think>' })); state.thinkingActive = false; }
                         sse(chunk({ tool_calls: [{ index: state.toolCallIndex++, id: exec.toolCallId, type: 'function', function: { name: exec.toolName, arguments: exec.decodedArgs } }] }));
-                        activeSessions.set(sessionKey, { h2Client, h2Stream, heartbeatTimer, blobStore: payload.blobStore, mcpTools: payload.mcpTools, pendingExecs: state.pendingExecs, lastActiveAt: Date.now() });
+                        const bridge: ActiveSession = { h2Client, h2Stream, heartbeatTimer, blobStore: payload.blobStore, mcpTools: payload.mcpTools, pendingExecs: state.pendingExecs, lastActiveAt: Date.now(), keys: [] };
+                        registerBridge(bridge, bridgeKeysFor(sessionKey, state.pendingExecs));
                         sse(chunk({}, 'tool_calls')); done(); end();
                     });
             } catch { /* skip */ }
