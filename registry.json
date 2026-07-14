@@ -1,7 +1,7 @@
 {
     "$schema": "./registry.schema.json",
     "version": "1.0.0",
-    "lastUpdated": "2026-07-14T00:00:00Z",
+    "lastUpdated": "2026-07-14T20:07:08Z",
     "plugins": [
         {
             "id": "hello-world",
@@ -92,7 +92,7 @@
         {
             "id": "openai-codex-auth",
             "name": "OpenAI Codex Auth",
-            "version": "1.8.6",
+            "version": "1.8.8",
             "description": "Use ChatGPT Plus/Pro subscription to access OpenAI Codex models via OAuth. Multi-account with email, avatar (via Gravatar), and quota in settings. GPT Image 2 generation and editing.",
             "author": {
                 "name": "Alma Community"
