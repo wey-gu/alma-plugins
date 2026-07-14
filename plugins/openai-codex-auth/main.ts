@@ -440,6 +440,21 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                             : undefined;
                     const reasoningEffort = isExplicitVariant ? suffixEffort : incomingEffort ?? suffixEffort;
 
+                    // De-sugar 'ultra' to the actual wire effort.
+                    // 'ultra' is a CLIENT-SIDE preset in the official Codex CLI, NOT a
+                    // valid `reasoning.effort` wire value: the ChatGPT Codex
+                    // /backend-api/codex/responses endpoint rejects it with
+                    //   400 "Invalid value: 'ultra'. Supported values are: 'none',
+                    //   'minimal', 'low', 'medium', 'high', and 'xhigh'."
+                    // (verified live; 'max' IS accepted, hence Max works but Ultra 400s).
+                    // Capturing the official CLI's outgoing request for an Ultra turn
+                    // shows it sends `reasoning: { effort: "max" }` — Ultra's distinct
+                    // behavior comes from the client's multi-agent orchestration
+                    // (code-mode exec tool, multi_agent_version v2), not a higher wire
+                    // effort. Mirror that: send 'max' on the wire when the user picks
+                    // Ultra so the request is accepted instead of 400ing.
+                    const wireReasoningEffort = reasoningEffort === 'ultra' ? 'max' : reasoningEffort;
+
                     // Filter and transform input (matching opencode's filterInput function)
                     // This is CRITICAL for Codex API compatibility:
                     // 1. Remove item_reference types (AI SDK construct not supported by Codex)
@@ -520,10 +535,12 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     // These are cached with ETag for 15 minutes
                     const codexInstructions = await getCodexInstructions(normalizedModel);
 
-                    // Build reasoning config (matching official Codex CLI's build_responses_request)
-                    const hasReasoning = reasoningEffort !== 'none';
+                    // Build reasoning config (matching official Codex CLI's build_responses_request).
+                    // Use wireReasoningEffort (ultra→max de-sugared) so we never send an
+                    // effort value the backend rejects.
+                    const hasReasoning = wireReasoningEffort !== 'none';
                     const reasoning = hasReasoning ? {
-                        effort: reasoningEffort,
+                        effort: wireReasoningEffort,
                         summary: 'auto',
                     } : undefined;
 
@@ -576,7 +593,10 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     delete transformedBody.max_completion_tokens;
 
                     body = JSON.stringify(transformedBody);
-                    logger.debug(`Transformed request: model=${originalModel}->${normalizedModel}, reasoning=${reasoningEffort}, streaming=${isStreaming}`);
+                    logger.debug(
+                        `Transformed request: model=${originalModel}->${normalizedModel}, reasoning=${reasoningEffort}` +
+                            `${wireReasoningEffort !== reasoningEffort ? `(wire:${wireReasoningEffort})` : ''}, streaming=${isStreaming}`
+                    );
                 } catch (e) {
                     logger.error('Error transforming request body:', e);
                 }
