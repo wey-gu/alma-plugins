@@ -244,6 +244,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     const getSettings = () => ({
         showInStatusBar: settings.get<boolean>('toolMonitor.showInStatusBar', true),
         logToConsole: settings.get<boolean>('toolMonitor.logToConsole', true),
+        notifyOnError: settings.get<boolean>('toolMonitor.notifyOnError', false),
     });
 
     // Calculate totals for current thread
@@ -387,7 +388,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
     // Track tool errors
     const onErrorDisposable = events.on('tool.onError', (input, output) => {
-        const { logToConsole } = getSettings();
+        const { logToConsole, notifyOnError } = getSettings();
         const threadId = input.context.threadId;
         const stats = getToolStats(threadId, input.tool);
         const threadStats = getThreadStats(threadId);
@@ -419,8 +420,12 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             });
         }
 
-        // Show notification for failures
-        ui.showWarning(`Tool "${input.tool}" failed: ${input.error.message}`);
+        // Show notification for failures only when explicitly opted in.
+        // The failure is already surfaced inline in the tool card, so a popup
+        // is redundant and noisy — off by default.
+        if (notifyOnError) {
+            ui.showWarning(`Tool "${input.tool}" failed: ${input.error.message}`);
+        }
 
         // Only update status bar if this is the current thread
         if (threadId === currentThreadId) {

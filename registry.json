@@ -75,7 +75,7 @@
         {
             "id": "tool-monitor",
             "name": "Tool Monitor",
-            "version": "1.2.3",
+            "version": "1.2.4",
             "description": "Monitor and track all tool executions with statistics and performance metrics. Persists data across sessions and loads historical data from messages.",
             "author": {
                 "name": "Alma Team",
