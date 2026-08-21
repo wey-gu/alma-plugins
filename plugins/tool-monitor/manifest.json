@@ -1,7 +1,7 @@
 {
     "id": "tool-monitor",
     "name": "Tool Monitor",
-    "version": "1.2.3",
+    "version": "1.2.4",
     "description": "Monitor and track all tool executions with statistics and performance metrics. Persists data across sessions and loads historical data from messages.",
     "author": {
         "name": "Alma Team"
@@ -44,6 +44,11 @@
                     "type": "boolean",
                     "default": true,
                     "description": "Log tool executions to console"
+                },
+                "toolMonitor.notifyOnError": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Show a popup notification when a tool call fails (failures are already shown inline in the tool card)"
                 }
             }
         }

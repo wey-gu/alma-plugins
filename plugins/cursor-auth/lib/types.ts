@@ -36,6 +36,22 @@ export interface CursorModel {
     maxTokens: number;
 }
 
+/**
+ * A picker entry after collapsing Cursor's per-effort/thinking variants
+ * (e.g. claude-fable-5-{low..max} + claude-fable-5-thinking-{low..max})
+ * into one model whose effort is driven by the composer's thinking selector.
+ */
+export interface CollapsedCursorModel extends CursorModel {
+    /**
+     * Thinking-selector levels (Alma vocab, 'off' excluded) this entry can
+     * reach. Undefined => group has a thinking variant but no effort tiers,
+     * so the composer falls back to its default level set.
+     */
+    reasoningLevels?: string[];
+    /** Number of backend variants merged into this entry (1 = not merged). */
+    variantCount: number;
+}
+
 // ============================================================================
 // Proxy Types
 // ============================================================================
@@ -71,6 +87,12 @@ export interface ChatCompletionRequest {
     max_tokens?: number;
     tools?: OpenAIToolDef[];
     tool_choice?: unknown;
+    /**
+     * Composer thinking level forwarded by Alma via
+     * providerOptions['plugin-<id>'].reasoningEffort. Used to resolve a
+     * collapsed model id to the concrete Cursor variant slug.
+     */
+    reasoning_effort?: string;
 }
 
 export interface ToolResultInfo {

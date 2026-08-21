@@ -64,6 +64,7 @@ import {
     SetBlobResultSchema,
     ShellRejectedSchema,
     ShellResultSchema,
+    ShellStreamSchema,
     ToolCallSchema,
     UserMessageActionSchema,
     UserMessageSchema,
@@ -86,6 +87,7 @@ import type {
     StreamState,
     ToolResultInfo,
 } from './types';
+import { resolveCursorModelId } from './models';
 
 const CURSOR_API_URL = 'https://api2.cursor.sh';
 const CURSOR_CLIENT_VERSION = 'cli-2026.02.13-41ac335';
@@ -110,9 +112,35 @@ interface ActiveSession {
     pendingExecs: PendingExec[];
     /** Last time this session was created or refreshed. */
     lastActiveAt: number;
+    /** Every activeSessions map key this bridge is registered under (see registerBridge). */
+    keys: string[];
 }
 
+// Bridges are keyed primarily by `tc:<toolCallId>` — tool call ids are globally
+// unique, so two parallel conversations never collide even if their opening
+// messages are byte-identical. A content-derived key is also registered as a
+// fallback for the pre-tool-call cleanup path. registerBridge stores a bridge
+// under all its keys and records them so deleteBridge can remove every one.
 const activeSessions = new Map<string, ActiveSession>();
+
+function registerBridge(bridge: ActiveSession, keys: string[]): void {
+    bridge.keys = keys;
+    for (const k of keys) activeSessions.set(k, bridge);
+}
+
+function deleteBridge(bridge: ActiveSession): void {
+    for (const k of bridge.keys) {
+        if (activeSessions.get(k) === bridge) activeSessions.delete(k);
+    }
+}
+
+function bridgeKeysFor(sessionKey: string, execs: PendingExec[]): string[] {
+    const keys = [sessionKey];
+    for (const e of execs) {
+        if (e.toolCallId) keys.push(`tc:${e.toolCallId}`);
+    }
+    return keys;
+}
 let sessionGcTimer: NodeJS.Timeout | undefined;
 
 /** Idle bridge timeout: if a tool result hasn't arrived in this window the bridge is GC'd. */
@@ -120,16 +148,17 @@ const SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 function destroySession(session: ActiveSession): void {
     clearInterval(session.heartbeatTimer);
+    // Close only the per-turn stream, never the underlying h2 session — it is
+    // shared and reused across requests (see getSharedH2Session).
     try { session.h2Stream.close(); } catch {}
-    try { session.h2Client.close(); } catch {}
 }
 
 function gcStaleSessions(): void {
     const now = Date.now();
-    for (const [key, session] of activeSessions) {
+    for (const session of new Set(activeSessions.values())) {
         if (now - session.lastActiveAt > SESSION_IDLE_TIMEOUT_MS) {
             destroySession(session);
-            activeSessions.delete(key);
+            deleteBridge(session);
         }
     }
 }
@@ -217,10 +246,11 @@ export function stopProxy(): void {
         clearInterval(sessionGcTimer);
         sessionGcTimer = undefined;
     }
-    for (const [key, session] of activeSessions) {
+    for (const session of new Set(activeSessions.values())) {
         destroySession(session);
-        activeSessions.delete(key);
     }
+    activeSessions.clear();
+    dropSharedH2Session();
 }
 
 /**
@@ -270,7 +300,12 @@ function handleChatCompletion(
     logger: Logger,
 ): void {
     const { systemPrompt, userText, images, turns, toolResults } = parseMessages(body.messages);
-    const modelId = body.model;
+    // Collapsed picker ids (e.g. claude-fable-5) are not real backend slugs —
+    // resolve them to the concrete variant using the composer's thinking level.
+    const modelId = resolveCursorModelId(body.model, body.reasoning_effort);
+    if (modelId !== body.model) {
+        logger.debug(`Cursor proxy: resolved ${body.model} (effort=${body.reasoning_effort ?? 'default'}) -> ${modelId}`);
+    }
     const tools = body.tools ?? [];
 
     if (!userText && toolResults.length === 0) {
@@ -280,17 +315,25 @@ function handleChatCompletion(
     }
 
     const sessionKey = deriveSessionKey(modelId, body.messages);
-    const activeSession = activeSessions.get(sessionKey);
+    // Resume prefers an exact tool-call-id match (collision-proof across parallel
+    // conversations); the content-derived key is only a fallback.
+    let activeSession: ActiveSession | undefined;
+    for (const r of toolResults) {
+        if (!r.toolCallId) continue;
+        const b = activeSessions.get(`tc:${r.toolCallId}`);
+        if (b) { activeSession = b; break; }
+    }
+    if (!activeSession) activeSession = activeSessions.get(sessionKey);
 
     if (activeSession && toolResults.length > 0) {
-        activeSessions.delete(sessionKey);
+        deleteBridge(activeSession);
         resumeWithToolResults(activeSession, toolResults, modelId, sessionKey, res);
         return;
     }
 
     if (activeSession) {
         destroySession(activeSession);
-        activeSessions.delete(sessionKey);
+        deleteBridge(activeSession);
     }
 
     // Bridge died but caller is sending tool results: rebuild the conversation
@@ -325,13 +368,42 @@ function handleChatCompletion(
     }
 
     const mcpTools = buildMcpToolDefinitions(tools);
-    const payload = buildCursorRequest(modelId, systemPrompt, effectiveUserText, images);
+
+    // The AI SDK only sends an explicit `stream: true` for streaming calls
+    // (streamText); non-streaming calls (generateText — tool analysis, the
+    // Tool Model test, title generation) OMIT the field entirely. Treating
+    // "not false" as streaming handed SSE to JSON-expecting clients, which
+    // broke every generateText call through this provider.
+    const isStreaming = body.stream === true;
+
+    // Tool-less non-streaming calls (generateText utilities: tool analysis,
+    // title generation) want a plain answer, not agentic behavior.
+    const isUtilityCall = !isStreaming && mcpTools.length === 0;
+
+    // ASK mode discourages Cursor's built-in workspace tools (shell/ls/read),
+    // which this proxy has to reject anyway.
+    const mode = isUtilityCall ? AGENT_MODE_ASK : undefined;
+
+    // Cursor's backend is an agent harness: the root system prompt is weak
+    // context there, and the model treats the embedded user message as a task
+    // to EXECUTE (observed live: a tool-analysis prompt got back "I can't
+    // access your ~/Downloads, run this command yourself" instead of the
+    // requested JSON). Inlining the instructions into the live message makes
+    // them binding again.
+    let promptSystem = systemPrompt;
+    let promptUser = effectiveUserText;
+    if (isUtilityCall && systemPrompt) {
+        promptUser = `<instructions>\n${systemPrompt}\n</instructions>\n\n${effectiveUserText}\n\n(Follow <instructions> exactly. Do NOT attempt to execute the task yourself — no tools.)`;
+        promptSystem = '';
+    }
+
+    const payload = buildCursorRequest(modelId, promptSystem, promptUser, images, mode);
     payload.mcpTools = mcpTools;
 
-    if (body.stream === false) {
-        handleNonStreaming(payload, accessToken, modelId, res, logger);
-    } else {
+    if (isStreaming) {
         handleStreaming(payload, accessToken, modelId, sessionKey, res);
+    } else {
+        handleNonStreaming(payload, accessToken, modelId, res, logger);
     }
 }
 
@@ -525,13 +597,36 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 // MCP Tool Definitions
 // ============================================================================
 
+// Cursor's Fable-5 agent harness registers internal tools with these names;
+// a client MCP tool with the same name collides upstream and the whole turn
+// dies with resource_exhausted "Provider Error — We're having trouble
+// connecting to the model provider" (verified 2026-07-13 by probing every
+// Claude-native tool name against claude-fable-5-thinking-medium; other
+// models like claude-4.5-sonnet don't collide). Registered names get an
+// alma_ prefix and are decoded back when the server asks to execute them.
+const CURSOR_RESERVED_TOOL_NAMES = new Set([
+    'Task', 'TodoWrite', 'Read', 'Write', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
+]);
+const RESERVED_TOOL_PREFIX = 'alma_';
+
+function encodeToolName(name: string): string {
+    return CURSOR_RESERVED_TOOL_NAMES.has(name) ? RESERVED_TOOL_PREFIX + name : name;
+}
+
+function decodeToolName(name: string): string {
+    if (!name.startsWith(RESERVED_TOOL_PREFIX)) return name;
+    const stripped = name.slice(RESERVED_TOOL_PREFIX.length);
+    return CURSOR_RESERVED_TOOL_NAMES.has(stripped) ? stripped : name;
+}
+
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
     return tools.map((t) => {
         const fn = t.function;
         const jsonSchema: JsonValue = fn.parameters && typeof fn.parameters === 'object'
             ? (fn.parameters as JsonValue) : { type: 'object', properties: {}, required: [] };
         const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, jsonSchema));
-        return create(McpToolDefinitionSchema, { name: fn.name, description: fn.description || '', providerIdentifier: 'alma', toolName: fn.name, inputSchema });
+        const wireName = encodeToolName(fn.name);
+        return create(McpToolDefinitionSchema, { name: wireName, description: fn.description || '', providerIdentifier: 'alma', toolName: wireName, inputSchema });
     });
 }
 
@@ -606,7 +701,11 @@ function buildHistoryToolCallStep(tc: HistoryToolCall): Uint8Array {
     }));
 }
 
-function buildCursorRequest(modelId: string, systemPrompt: string, userText: string, images: ImageData[]): CursorRequestPayload {
+// agent.v1.AgentMode.ASK — plain Q&A mode; the server never invokes
+// workspace tools (shell/read/ls), which this proxy has to reject anyway.
+const AGENT_MODE_ASK = 2;
+
+function buildCursorRequest(modelId: string, systemPrompt: string, userText: string, images: ImageData[], mode?: number): CursorRequestPayload {
     const blobStore = new Map<string, Uint8Array>();
 
     const systemJson = JSON.stringify({ role: 'system', content: systemPrompt });
@@ -623,6 +722,7 @@ function buildCursorRequest(modelId: string, systemPrompt: string, userText: str
         todos: [], pendingToolCalls: [], previousWorkspaceUris: [],
         fileStates: {}, fileStatesV2: {}, summaryArchives: [], turnTimings: [],
         subagentStates: {}, selfSummaryCount: 0, readPaths: [],
+        ...(mode !== undefined && { mode }),
     });
 
     // Build UserMessage with optional image support via selectedContext
@@ -664,9 +764,40 @@ function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
 function parseConnectEndStream(data: Uint8Array): Error | null {
     try {
         const p = JSON.parse(new TextDecoder().decode(data));
-        if (p?.error) return new Error(`Connect error ${p.error.code ?? 'unknown'}: ${p.error.message ?? 'Unknown'}`);
+        if (p?.error) return new Error(formatConnectError(p.error));
         return null;
     } catch { return new Error('Failed to parse Connect end stream'); }
+}
+
+/**
+ * Cursor buries the human-readable reason in error.details[].debug.details
+ * (title/detail/buttons); the top-level message is often the literal string
+ * "Error". Observed live with ERROR_MODEL_BLOCKED: "You must acknowledge
+ * Fable 5's data retention policy to use the model." — without this parsing
+ * the user just sees "failed_precondition: Error".
+ */
+function formatConnectError(error: any): string {
+    const code = error.code ?? 'unknown';
+    let message: string = error.message ?? 'Unknown';
+    const details = Array.isArray(error.details) ? error.details : [];
+    for (const d of details) {
+        const debug = d?.debug;
+        const dd = debug?.details;
+        if (dd?.title || dd?.detail) {
+            message = [dd.title, dd.detail].filter(Boolean).join(' — ');
+            const buttons: any[] = Array.isArray(dd.buttons) ? dd.buttons : [];
+            const urls = buttons.map((b) => b?.url?.url).filter(Boolean);
+            if (urls.length > 0) message += ` (see ${urls.join(', ')})`;
+            if (buttons.some((b) => b?.dashboardAction)) {
+                message += ' — open Cursor IDE, select this model once and accept the prompt, then retry here.';
+            }
+            break;
+        }
+        if (typeof debug?.error === 'string' && debug.error) {
+            message = message === 'Error' ? debug.error : `${message} (${debug.error})`;
+        }
+    }
+    return `Connect error ${code}: ${message}`;
 }
 
 function makeHeartbeatBytes(): Buffer {
@@ -678,17 +809,66 @@ function makeHeartbeatBytes(): Buffer {
 // HTTP/2 Stream
 // ============================================================================
 
-function createH2Stream(accessToken: string): { client: http2.ClientHttp2Session; stream: http2.ClientHttp2Stream } {
-    const client = http2.connect(CURSOR_API_URL);
-    client.on('error', () => {});
-    const stream = client.request({
+// ---- Shared HTTP/2 session (connection reuse) ----
+// A fresh TLS+HTTP/2 connection to api2.cursor.sh costs ~1.1s of handshake and
+// was previously paid on EVERY chat message. HTTP/2 multiplexes many streams
+// over one session, so we keep a single warm session and open a cheap stream
+// per request. A periodic PING keeps it alive across idle; any error/close/
+// goaway drops the cached session so the next request lazily reconnects. Auth
+// is per-stream (Bearer header on request()), so token refresh is unaffected.
+let sharedH2Session: http2.ClientHttp2Session | undefined;
+let sharedH2KeepAlive: NodeJS.Timeout | undefined;
+
+function dropSharedH2Session(): void {
+    if (sharedH2KeepAlive) { clearInterval(sharedH2KeepAlive); sharedH2KeepAlive = undefined; }
+    const s = sharedH2Session;
+    sharedH2Session = undefined;
+    if (s) { try { s.close(); } catch {} }
+}
+
+function getSharedH2Session(): http2.ClientHttp2Session {
+    if (sharedH2Session && !sharedH2Session.closed && !sharedH2Session.destroyed) {
+        return sharedH2Session;
+    }
+    if (sharedH2Session) dropSharedH2Session();
+
+    const session = http2.connect(CURSOR_API_URL);
+    sharedH2Session = session;
+    // Swallow transport errors but forget the session so the next call reconnects.
+    const forget = () => { if (sharedH2Session === session) dropSharedH2Session(); };
+    session.on('error', forget);
+    session.on('close', forget);
+    session.on('goaway', forget);
+
+    sharedH2KeepAlive = setInterval(() => {
+        if (session.closed || session.destroyed) { forget(); return; }
+        try { session.ping(() => {}); } catch { forget(); }
+    }, 30_000);
+    sharedH2KeepAlive.unref?.();
+
+    return session;
+}
+
+function openH2Stream(session: http2.ClientHttp2Session, accessToken: string): http2.ClientHttp2Stream {
+    return session.request({
         ':method': 'POST', ':path': '/agent.v1.AgentService/Run',
         'content-type': 'application/connect+proto', 'connect-protocol-version': '1',
         'te': 'trailers', 'authorization': `Bearer ${accessToken}`,
         'x-ghost-mode': 'true', 'x-cursor-client-version': CURSOR_CLIENT_VERSION,
         'x-cursor-client-type': 'cli', 'x-request-id': crypto.randomUUID(),
     });
-    return { client, stream };
+}
+
+function createH2Stream(accessToken: string): { client: http2.ClientHttp2Session; stream: http2.ClientHttp2Stream } {
+    let session = getSharedH2Session();
+    try {
+        return { client: session, stream: openH2Stream(session, accessToken) };
+    } catch {
+        // Session died between the health check and request() — reconnect once.
+        dropSharedH2Session();
+        session = getSharedH2Session();
+        return { client: session, stream: openH2Stream(session, accessToken) };
+    }
 }
 
 // ============================================================================
@@ -723,20 +903,26 @@ function handleKvMessage(kv: KvServerMessage, blobStore: Map<string, Uint8Array>
 
 function handleExecMessage(exec: ExecServerMessage, mcpTools: McpToolDefinition[], sendFrame: (data: Buffer) => void, onMcpExec: (e: PendingExec) => void): void {
     const c = exec.message.case;
-    const R = 'Tool not available in this environment. Use the MCP tools provided instead.';
+    const R = mcpTools.length > 0
+        ? 'Tool not available in this environment. Use the MCP tools provided instead.'
+        : 'Tool not available in this environment. Do not retry tools — answer directly in your final message.';
 
     if (c === 'requestContextArgs') {
         const ctx = create(RequestContextSchema, { rules: [], repositoryInfo: [], tools: mcpTools, gitRepos: [], projectLayouts: [], mcpInstructions: [], fileContents: {}, customSubagents: [] });
         sendExec(exec, 'requestContextResult', create(RequestContextResultSchema, { result: { case: 'success', value: create(RequestContextSuccessSchema, { requestContext: ctx }) } }), sendFrame);
     } else if (c === 'mcpArgs') {
         const a = exec.message.value;
-        onMcpExec({ execId: exec.execId, execMsgId: exec.id, toolCallId: a.toolCallId || crypto.randomUUID(), toolName: a.toolName || a.name, decodedArgs: JSON.stringify(decodeMcpArgsMap(a.args ?? {})) });
+        onMcpExec({ execId: exec.execId, execMsgId: exec.id, toolCallId: a.toolCallId || crypto.randomUUID(), toolName: decodeToolName(a.toolName || a.name), decodedArgs: JSON.stringify(decodeMcpArgsMap(a.args ?? {})) });
     } else if (c === 'readArgs') sendExec(exec, 'readResult', create(ReadResultSchema, { result: { case: 'rejected', value: create(ReadRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
     else if (c === 'lsArgs') sendExec(exec, 'lsResult', create(LsResultSchema, { result: { case: 'rejected', value: create(LsRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
     else if (c === 'grepArgs') sendExec(exec, 'grepResult', create(GrepResultSchema, { result: { case: 'error', value: create(GrepErrorSchema, { error: R }) } }), sendFrame);
     else if (c === 'writeArgs') sendExec(exec, 'writeResult', create(WriteResultSchema, { result: { case: 'rejected', value: create(WriteRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
     else if (c === 'deleteArgs') sendExec(exec, 'deleteResult', create(DeleteResultSchema, { result: { case: 'rejected', value: create(DeleteRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
-    else if (c === 'shellArgs' || c === 'shellStreamArgs') { const a = exec.message.value; sendExec(exec, 'shellResult', create(ShellResultSchema, { result: { case: 'rejected', value: create(ShellRejectedSchema, { command: a.command ?? '', workingDirectory: a.workingDirectory ?? '', reason: R, isReadonly: false }) } }), sendFrame); }
+    else if (c === 'shellArgs') { const a = exec.message.value; sendExec(exec, 'shellResult', create(ShellResultSchema, { result: { case: 'rejected', value: create(ShellRejectedSchema, { command: a.command ?? '', workingDirectory: a.workingDirectory ?? '', reason: R, isReadonly: false }) } }), sendFrame); }
+    // Streaming shell calls must be answered on the `shellStream` case — a
+    // plain shellResult is silently ignored by the server, which then waits
+    // on the exec forever and stalls the whole turn (observed 2026-07-13).
+    else if (c === 'shellStreamArgs') { const a = exec.message.value; sendExec(exec, 'shellStream', create(ShellStreamSchema, { event: { case: 'rejected', value: create(ShellRejectedSchema, { command: a.command ?? '', workingDirectory: a.workingDirectory ?? '', reason: R, isReadonly: false }) } }), sendFrame); }
     else if (c === 'backgroundShellSpawnArgs') { const a = exec.message.value; sendExec(exec, 'backgroundShellSpawnResult', create(BackgroundShellSpawnResultSchema, { result: { case: 'rejected', value: create(ShellRejectedSchema, { command: a.command ?? '', workingDirectory: a.workingDirectory ?? '', reason: R, isReadonly: false }) } }), sendFrame); }
     else if (c === 'writeShellStdinArgs') sendExec(exec, 'writeShellStdinResult', create(WriteShellStdinResultSchema, { result: { case: 'error', value: create(WriteShellStdinErrorSchema, { error: R }) } }), sendFrame);
     else if (c === 'fetchArgs') sendExec(exec, 'fetchResult', create(FetchResultSchema, { result: { case: 'error', value: create(FetchErrorSchema, { url: exec.message.value.url ?? '', error: R }) } }), sendFrame);
@@ -766,9 +952,14 @@ function handleStreaming(payload: CursorRequestPayload, accessToken: string, mod
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
 
     let closed = false;
-    const sse = (d: object) => { if (!closed) res.write(`data: ${JSON.stringify(d)}\n\n`); };
-    const done = () => { if (!closed) res.write('data: [DONE]\n\n'); };
-    const end = () => { if (closed) return; closed = true; res.end(); };
+    // A client that disconnects mid-stream destroys `res`; without these
+    // listeners the next res.write() raises an unhandled 'error' event and
+    // takes down the whole main process.
+    res.on('close', () => { closed = true; });
+    res.on('error', () => { closed = true; });
+    const sse = (d: object) => { if (!closed) try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch { closed = true; } };
+    const done = () => { if (!closed) try { res.write('data: [DONE]\n\n'); } catch { closed = true; } };
+    const end = () => { if (closed) return; closed = true; try { res.end(); } catch {} };
     const chunk = (delta: Record<string, unknown>, finish: string | null = null) => ({ id, object: 'chat.completion.chunk', created, model: modelId, choices: [{ index: 0, delta, finish_reason: finish }] });
 
     const state: StreamState = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
@@ -782,8 +973,9 @@ function handleStreaming(payload: CursorRequestPayload, accessToken: string, mod
     const processData = buildStreamProcessor(h2Stream, payload, state, chunk, sse, done, end, h2Client, heartbeatTimer, sessionKey, () => { mcpExecReceived = true; });
 
     h2Stream.on('data', processData);
-    h2Stream.on('end', () => { clearInterval(heartbeatTimer); h2Client.close(); if (!mcpExecReceived) { if (state.thinkingActive) sse(chunk({ content: '</think>' })); sse(chunk({}, 'stop')); done(); end(); } });
-    h2Stream.on('error', () => { clearInterval(heartbeatTimer); try { h2Client.close(); } catch {} if (!mcpExecReceived) { sse(chunk({}, 'stop')); done(); end(); } });
+    // Close only the finished/errored stream; the h2 session is shared and stays warm.
+    h2Stream.on('end', () => { clearInterval(heartbeatTimer); if (!mcpExecReceived) { if (state.thinkingActive) sse(chunk({ content: '</think>' })); sse(chunk({}, 'stop')); done(); end(); } });
+    h2Stream.on('error', () => { clearInterval(heartbeatTimer); try { h2Stream.close(); } catch {} if (!mcpExecReceived) { sse(chunk({}, 'stop')); done(); end(); } });
 }
 
 function buildStreamProcessor(
@@ -816,7 +1008,8 @@ function buildStreamProcessor(
                         state.pendingExecs.push(exec); onMcpFlag();
                         if (state.thinkingActive) { sse(chunk({ content: '</think>' })); state.thinkingActive = false; }
                         sse(chunk({ tool_calls: [{ index: state.toolCallIndex++, id: exec.toolCallId, type: 'function', function: { name: exec.toolName, arguments: exec.decodedArgs } }] }));
-                        activeSessions.set(sessionKey, { h2Client, h2Stream, heartbeatTimer, blobStore: payload.blobStore, mcpTools: payload.mcpTools, pendingExecs: state.pendingExecs, lastActiveAt: Date.now() });
+                        const bridge: ActiveSession = { h2Client, h2Stream, heartbeatTimer, blobStore: payload.blobStore, mcpTools: payload.mcpTools, pendingExecs: state.pendingExecs, lastActiveAt: Date.now(), keys: [] };
+                        registerBridge(bridge, bridgeKeysFor(sessionKey, state.pendingExecs));
                         sse(chunk({}, 'tool_calls')); done(); end();
                     });
             } catch { /* skip */ }
@@ -850,9 +1043,12 @@ function resumeWithToolResults(session: ActiveSession, toolResults: ToolResultIn
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
 
     let closed = false;
-    const sse = (d: object) => { if (!closed) res.write(`data: ${JSON.stringify(d)}\n\n`); };
-    const done = () => { if (!closed) res.write('data: [DONE]\n\n'); };
-    const end = () => { if (closed) return; closed = true; res.end(); };
+    // Same disconnect guards as handleStreaming — see comment there.
+    res.on('close', () => { closed = true; });
+    res.on('error', () => { closed = true; });
+    const sse = (d: object) => { if (!closed) try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch { closed = true; } };
+    const done = () => { if (!closed) try { res.write('data: [DONE]\n\n'); } catch { closed = true; } };
+    const end = () => { if (closed) return; closed = true; try { res.end(); } catch {} };
     const chunk = (delta: Record<string, unknown>, finish: string | null = null) => ({ id, object: 'chat.completion.chunk', created, model: modelId, choices: [{ index: 0, delta, finish_reason: finish }] });
 
     const state: StreamState = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
@@ -861,8 +1057,9 @@ function resumeWithToolResults(session: ActiveSession, toolResults: ToolResultIn
     const processData = buildStreamProcessor(h2Stream, { blobStore, mcpTools }, state, chunk, sse, done, end, h2Client, heartbeatTimer, sessionKey, () => { mcpExecReceived = true; });
 
     h2Stream.on('data', processData);
-    h2Stream.on('end', () => { clearInterval(heartbeatTimer); h2Client.close(); if (!mcpExecReceived) { if (state.thinkingActive) sse(chunk({ content: '</think>' })); sse(chunk({}, 'stop')); done(); end(); } });
-    h2Stream.on('error', () => { clearInterval(heartbeatTimer); try { h2Client.close(); } catch {} if (!mcpExecReceived) { sse(chunk({}, 'stop')); done(); end(); } });
+    // Close only the finished/errored stream; the h2 session is shared and stays warm.
+    h2Stream.on('end', () => { clearInterval(heartbeatTimer); if (!mcpExecReceived) { if (state.thinkingActive) sse(chunk({ content: '</think>' })); sse(chunk({}, 'stop')); done(); end(); } });
+    h2Stream.on('error', () => { clearInterval(heartbeatTimer); try { h2Stream.close(); } catch {} if (!mcpExecReceived) { sse(chunk({}, 'stop')); done(); end(); } });
 }
 
 // ============================================================================
@@ -882,18 +1079,26 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
     let pendingBuffer = Buffer.alloc(0);
     const collectedToolCalls: Array<{ id: string; name: string; argsJson: string }> = [];
     let responded = false;
+    let endStreamError: Error | null = null;
     const state: StreamState = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
 
     const cleanup = () => {
         clearInterval(heartbeatTimer);
+        // Close only the stream; the h2 session is shared and stays warm.
         try { h2Stream.close(); } catch {}
-        try { h2Client.close(); } catch {}
     };
+
+    // Same disconnect guards as handleStreaming — see comment there. On a
+    // client disconnect, also tear down the h2 bridge and heartbeat so they
+    // don't keep running against a dead response.
+    res.on('error', () => {});
+    res.on('close', () => { if (!responded) { responded = true; cleanup(); } });
 
     const respond = (finishReason: 'stop' | 'tool_calls' | 'error', errMessage?: string) => {
         if (responded) return;
         responded = true;
         cleanup();
+        if (res.destroyed || res.headersSent) return;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         const message: Record<string, unknown> = { role: 'assistant', content: fullText || null };
         if (collectedToolCalls.length > 0) {
@@ -921,14 +1126,26 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
             if (pendingBuffer.length < 5 + msgLen) break;
             const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
             pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-            if (flags & CONNECT_END_STREAM_FLAG) continue;
+            if (flags & CONNECT_END_STREAM_FLAG) {
+                // Surface server-side rejections (e.g. ERROR_MODEL_BLOCKED)
+                // instead of silently returning empty content.
+                const e = parseConnectEndStream(messageBytes);
+                if (e) {
+                    endStreamError = e;
+                    logger.error('Cursor proxy non-stream end-stream error:', e.message);
+                }
+                continue;
+            }
             try {
                 processServerMessage(
                     fromBinary(AgentServerMessageSchema, messageBytes),
                     payload.blobStore, payload.mcpTools,
                     (data) => { if (!h2Stream.closed && !h2Stream.destroyed) h2Stream.write(data); },
                     state,
-                    (text) => { fullText += text; },
+                    // Drop thinking deltas: non-streaming callers expect only the
+                    // final answer, and stray reasoning text (which often contains
+                    // braces) corrupts JSON extraction downstream.
+                    (text, isThinking) => { if (!isThinking) fullText += text; },
                     (exec) => {
                         // In non-streaming mode we cannot keep the bridge alive
                         // because there is no SSE to pause. Collect tool calls
@@ -950,6 +1167,7 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
 
     h2Stream.on('end', () => {
         if (collectedToolCalls.length > 0) respond('tool_calls');
+        else if (endStreamError) respond('error', endStreamError.message);
         else respond('stop');
     });
 
@@ -957,4 +1175,14 @@ function handleNonStreaming(payload: CursorRequestPayload, accessToken: string, 
         logger.error('Cursor proxy non-stream h2 error:', err);
         respond('error', err instanceof Error ? err.message : String(err));
     });
+
+    // Non-streaming callers (generateText) have no way to abort; if the
+    // bridge turn stalls, answer with whatever accumulated instead of
+    // hanging the caller and leaking the h2 session forever.
+    const turnDeadline = setTimeout(() => {
+        logger.warn('Cursor proxy non-stream turn exceeded 120s, responding with partial text');
+        respond('stop');
+    }, 120_000);
+    turnDeadline.unref?.();
+    res.on('close', () => clearTimeout(turnDeadline));
 }

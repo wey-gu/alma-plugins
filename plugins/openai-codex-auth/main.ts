@@ -17,7 +17,8 @@
 import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 import { TokenStore } from './lib/token-store';
 import { getAuthorizationUrl, exchangeCodeForTokens } from './lib/auth';
-import { getActiveModels, setCachedModels, buildModelsFromApiResponse, getBaseModelId, getReasoningEffort } from './lib/models';
+import { getActiveModels, setCachedModels, isCatalogCached, buildModelsFromApiResponse, getBaseModelId, getReasoningEffort, collapseReasoningVariants, CODEX_IMAGE_MODELS } from './lib/models';
+import type { CodexModelInfo } from './lib/types';
 import { getCodexInstructions } from './lib/codex-instructions';
 import { addAlmaBridgeMessage } from './lib/alma-codex-bridge';
 import { fetchAccountQuota } from './lib/rate-limits';
@@ -29,6 +30,12 @@ import { fetchAccountProfile, avatarUrlForEmail } from './lib/profile';
 
 const CODEX_BASE_URL = 'https://chatgpt.com/backend-api';
 const DUMMY_API_KEY = 'chatgpt-oauth';
+
+// The Codex backend gates newer models (e.g. gpt-5.6-luna) on a User-Agent
+// that identifies a known Codex client — without it /codex/responses 404s
+// with "Model not found" even though the model is in the /codex/models
+// catalog. Verified 2026-07: default undici UA → 404, codex_cli_rs UA → 200.
+const CODEX_USER_AGENT = 'codex_cli_rs/0.144.0 (Mac OS 26.0.0; arm64) Apple_Terminal/455';
 
 // OpenAI-specific headers (matching opencode)
 const OPENAI_HEADERS = {
@@ -44,6 +51,30 @@ const URL_PATHS = {
     RESPONSES: '/responses',
     CODEX_RESPONSES: '/codex/responses',
 } as const;
+
+/**
+ * Aspect-ratio hints Alma sends with image requests, mapped onto sizes that
+ * satisfy gpt-image-2's constraints (edges multiples of 16 and <= 3840px,
+ * long:short ratio <= 3:1, total pixels within 0.65-8.3MP). gpt-image-1.5
+ * only accepts the three classic sizes, so unmapped/legacy ratios fall back
+ * to the backend's `auto` by omitting `size`.
+ */
+const IMAGE_ASPECT_SIZES: Record<string, string> = {
+    '1:1': '1024x1024',
+    '3:2': '1536x1024',
+    '2:3': '1024x1536',
+    '16:9': '2048x1152',
+    '9:16': '1152x2048',
+    '4:3': '1600x1200',
+    '3:4': '1200x1600',
+    '2:1': '2048x1024',
+    '1:2': '1024x2048',
+    '20:9': '2560x1152',
+    '9:20': '1152x2560',
+};
+
+/** Sizes gpt-image-1.x models accept (everything else must fall back to auto). */
+const LEGACY_IMAGE_SIZES = new Set(['1024x1024', '1536x1024', '1024x1536']);
 
 // HTTP status codes (matching opencode)
 const HTTP_STATUS = {
@@ -88,22 +119,32 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             fullText += decoder.decode(value, { stream: true });
         }
 
-        // Parse SSE events to extract the final response
+        // Parse SSE events to extract the final response.
+        // The ChatGPT Codex backend (observed live 2026-07-13 with gpt-5.5 and
+        // gpt-5.6-*) emits `response.completed` with an EMPTY `output` array —
+        // the real items only arrive via `response.output_item.done` events.
+        // Collect those as a fallback so the answer isn't silently dropped.
         const lines = fullText.split('\n');
-        let finalResponse: unknown = null;
+        let finalResponse: { output?: unknown[] } | null = null;
+        const doneItems: unknown[] = [];
 
         for (const line of lines) {
             if (line.startsWith('data: ')) {
                 try {
                     const data = JSON.parse(line.substring(6));
-                    if (data.type === 'response.done' || data.type === 'response.completed') {
+                    if (data.type === 'response.output_item.done' && data.item) {
+                        doneItems.push(data.item);
+                    } else if (data.type === 'response.done' || data.type === 'response.completed') {
                         finalResponse = data.response;
-                        break;
                     }
                 } catch {
                     // Skip malformed JSON
                 }
             }
+        }
+
+        if (finalResponse && doneItems.length > 0 && (!Array.isArray(finalResponse.output) || finalResponse.output.length === 0)) {
+            finalResponse.output = doneItems;
         }
 
         if (!finalResponse) {
@@ -273,6 +314,87 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 url = input.url;
             }
 
+            // Step 2.5: Image generation/editing requests take a separate path.
+            // Alma's generateImageViaPluginProvider POSTs Grok-style JSON
+            // ({ model, prompt, response_format, images?: [{url}], aspect_ratio? })
+            // to <baseURL>/images/generations|edits. The Codex subscription
+            // backend serves the Images API at /backend-api/codex/images/* as
+            // JSON (verified live 2026-07-04): generations take
+            // { model, prompt, size? }; edits take
+            // { model, prompt, images: [{ image_url: <data URL> }] }. Responses
+            // already come back as { data: [{ b64_json }] } — exactly the shape
+            // Alma expects — so they pass through untouched.
+            const imageEndpointMatch = url.match(/\/images\/(generations|edits)$/);
+            if (imageEndpointMatch) {
+                const isImageEdit = imageEndpointMatch[1] === 'edits';
+                const imageUrl = url.replace(/\/images\/(generations|edits)$/, '/codex/images/$1');
+                let imageBody = init?.body;
+
+                if (imageBody && typeof imageBody === 'string') {
+                    try {
+                        const parsed = JSON.parse(imageBody);
+                        const model = getBaseModelId(parsed.model || 'gpt-image-2');
+                        const transformed: Record<string, unknown> = {
+                            model,
+                            prompt: parsed.prompt,
+                        };
+
+                        const size = IMAGE_ASPECT_SIZES[parsed.aspect_ratio as string];
+                        if (size && (model === 'gpt-image-2' || LEGACY_IMAGE_SIZES.has(size))) {
+                            transformed.size = size;
+                        }
+
+                        if (isImageEdit) {
+                            const refs: unknown[] = Array.isArray(parsed.images) ? parsed.images : [];
+                            transformed.images = refs
+                                .map((item: any) => (typeof item === 'string' ? item : item?.url ?? item?.image_url))
+                                .filter((u: unknown): u is string => typeof u === 'string')
+                                .map((u: string) => ({ image_url: u }));
+                        }
+
+                        imageBody = JSON.stringify(transformed);
+                        logger.info(`Image ${imageEndpointMatch[1]} request: model=${model}, size=${transformed.size ?? 'auto'}${isImageEdit ? `, refs=${(transformed.images as unknown[]).length}` : ''}`);
+                    } catch (e) {
+                        logger.error('Error transforming image request body:', e);
+                    }
+                }
+
+                const imageHeaders = new Headers(init?.headers ?? {});
+                imageHeaders.delete('x-api-key');
+                imageHeaders.set('Content-Type', 'application/json');
+                imageHeaders.set('Authorization', `Bearer ${accessToken}`);
+                imageHeaders.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
+                imageHeaders.set(OPENAI_HEADERS.ORIGINATOR, 'codex_cli_rs');
+                imageHeaders.set('User-Agent', CODEX_USER_AGENT);
+                imageHeaders.set('accept', 'application/json');
+
+                let imageResponse = await globalThis.fetch(imageUrl, {
+                    ...init,
+                    body: imageBody,
+                    headers: imageHeaders,
+                });
+
+                // Same invalidated-token recovery as the chat path: on 401,
+                // force-refresh once and retry.
+                if (imageResponse.status === 401) {
+                    const errText = await imageResponse.clone().text().catch(() => '');
+                    logger.warn(`Image API 401, forcing token refresh and retrying once: ${errText.slice(0, 200)}`);
+                    try {
+                        const newToken = await tokenStore.forceRefreshAccessToken();
+                        imageHeaders.set('Authorization', `Bearer ${newToken}`);
+                        imageResponse = await globalThis.fetch(imageUrl, {
+                            ...init,
+                            body: imageBody,
+                            headers: imageHeaders,
+                        });
+                    } catch (refreshErr) {
+                        logger.error('Forced token refresh failed:', refreshErr);
+                    }
+                }
+
+                return imageResponse;
+            }
+
             // Step 3: Rewrite URL for Codex backend: /responses -> /codex/responses
             const codexUrl = url.replace(URL_PATHS.RESPONSES, URL_PATHS.CODEX_RESPONSES);
             logger.debug(`Rewriting URL: ${url} -> ${codexUrl}`);
@@ -293,10 +415,45 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     // Extract prompt_cache_key for caching headers (matching opencode)
                     promptCacheKey = parsed.prompt_cache_key;
 
-                    // Normalize model name (e.g., gpt-5.2-codex-low -> gpt-5.2-codex)
+                    // Normalize model name (e.g., gpt-5.2-codex-low -> gpt-5.2-codex).
+                    // Hydrate first so id→base/effort resolution uses the real
+                    // catalog; the suffix-strip fallback in getBaseModelId still
+                    // covers the (now unlikely) unhydrated case.
+                    await ensureCatalogHydrated();
                     const originalModel = parsed.model || '';
                     const normalizedModel = getBaseModelId(originalModel);
-                    const reasoningEffort = getReasoningEffort(originalModel);
+
+                    // Reasoning-effort resolution.
+                    // - An explicit reasoning variant id (e.g. gpt-5.5-high) is the
+                    //   user's explicit pick and always wins.
+                    // - The base model id (no suffix) honors the composer's reasoning
+                    //   selector, which the core forwards on the request body as
+                    //   `reasoning.effort` (from providerOptions.openai.reasoningEffort).
+                    //   This lets a single base model cover every thinking level, so
+                    //   users no longer need a separate enabled model per effort.
+                    const suffixEffort = getReasoningEffort(originalModel);
+                    const isExplicitVariant = normalizedModel !== originalModel;
+                    const incomingEffort =
+                        typeof parsed?.reasoning?.effort === 'string' &&
+                        ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(parsed.reasoning.effort)
+                            ? parsed.reasoning.effort
+                            : undefined;
+                    const reasoningEffort = isExplicitVariant ? suffixEffort : incomingEffort ?? suffixEffort;
+
+                    // De-sugar 'ultra' to the actual wire effort.
+                    // 'ultra' is a CLIENT-SIDE preset in the official Codex CLI, NOT a
+                    // valid `reasoning.effort` wire value: the ChatGPT Codex
+                    // /backend-api/codex/responses endpoint rejects it with
+                    //   400 "Invalid value: 'ultra'. Supported values are: 'none',
+                    //   'minimal', 'low', 'medium', 'high', and 'xhigh'."
+                    // (verified live; 'max' IS accepted, hence Max works but Ultra 400s).
+                    // Capturing the official CLI's outgoing request for an Ultra turn
+                    // shows it sends `reasoning: { effort: "max" }` — Ultra's distinct
+                    // behavior comes from the client's multi-agent orchestration
+                    // (code-mode exec tool, multi_agent_version v2), not a higher wire
+                    // effort. Mirror that: send 'max' on the wire when the user picks
+                    // Ultra so the request is accepted instead of 400ing.
+                    const wireReasoningEffort = reasoningEffort === 'ultra' ? 'max' : reasoningEffort;
 
                     // Filter and transform input (matching opencode's filterInput function)
                     // This is CRITICAL for Codex API compatibility:
@@ -378,10 +535,12 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     // These are cached with ETag for 15 minutes
                     const codexInstructions = await getCodexInstructions(normalizedModel);
 
-                    // Build reasoning config (matching official Codex CLI's build_responses_request)
-                    const hasReasoning = reasoningEffort !== 'none';
+                    // Build reasoning config (matching official Codex CLI's build_responses_request).
+                    // Use wireReasoningEffort (ultra→max de-sugared) so we never send an
+                    // effort value the backend rejects.
+                    const hasReasoning = wireReasoningEffort !== 'none';
                     const reasoning = hasReasoning ? {
-                        effort: reasoningEffort,
+                        effort: wireReasoningEffort,
                         summary: 'auto',
                     } : undefined;
 
@@ -434,7 +593,10 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     delete transformedBody.max_completion_tokens;
 
                     body = JSON.stringify(transformedBody);
-                    logger.debug(`Transformed request: model=${originalModel}->${normalizedModel}, reasoning=${reasoningEffort}, streaming=${isStreaming}`);
+                    logger.debug(
+                        `Transformed request: model=${originalModel}->${normalizedModel}, reasoning=${reasoningEffort}` +
+                            `${wireReasoningEffort !== reasoningEffort ? `(wire:${wireReasoningEffort})` : ''}, streaming=${isStreaming}`
+                    );
                 } catch (e) {
                     logger.error('Error transforming request body:', e);
                 }
@@ -447,6 +609,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
             headers.set(OPENAI_HEADERS.BETA, 'responses=experimental');
             headers.set(OPENAI_HEADERS.ORIGINATOR, 'codex_cli_rs');
+            headers.set('User-Agent', CODEX_USER_AGENT);
             headers.set('accept', 'text/event-stream');
 
             // Set prompt cache headers if prompt_cache_key is present (matching opencode)
@@ -569,6 +732,179 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         }
     };
 
+    /**
+     * Image models exposed alongside the chat models. imageOutput routes them
+     * through Alma's handleImageGenerationRequest (Images API) instead of chat
+     * completions; vision lets users attach reference images for edits.
+     */
+    const imageModelEntries = () =>
+        CODEX_IMAGE_MODELS.map(model => ({
+            id: model.id,
+            name: model.name,
+            description: model.description,
+            capabilities: {
+                streaming: false,
+                reasoning: false,
+                functionCalling: false,
+                vision: true,
+                imageOutput: true,
+            },
+            providerOptions: {
+                baseModel: model.baseModel,
+            },
+        }));
+
+    // =========================================================================
+    // Model catalog persistence
+    //
+    // The bundled CODEX_MODELS list is a snapshot that lags the live backend.
+    // The freshly fetched catalog used to live only in an in-memory module
+    // cache (setCachedModels), so every cold start fell back to the stale
+    // snapshot — any enabled model newer than the snapshot (e.g. gpt-5.5) had
+    // no catalog entry, and GET /api/models reported all-false capabilities
+    // until the user manually clicked "Fetch". Persisting the catalog and
+    // restoring it on startup (plus a background refresh) makes capabilities
+    // load automatically on every launch.
+    // =========================================================================
+
+    const MODELS_CACHE_KEY = 'codex-models-cache-v1';
+
+    // Memoized hydration guard. initialize() awaits hydration, but the plugin
+    // host does not reliably await initialize() before the first getModels()
+    // call (observed after a hot-reload: getModels() served the stale snapshot
+    // until a manual Fetch, which in turn made the core read functionCalling as
+    // false and drop the Project/Tools/Skills buttons). So every catalog reader
+    // self-hydrates through this guard: the storage read happens at most once,
+    // and callers past that point always see the persisted catalog.
+    let hydrationPromise: Promise<void> | null = null;
+
+    /**
+     * Ensure the in-memory catalog is populated from persisted storage before a
+     * caller trusts getActiveModels(). Idempotent and concurrency-safe: the
+     * storage read is shared across all callers and skipped once the cache holds
+     * a live/persisted catalog (either from a prior hydrate or a live fetch).
+     */
+    const ensureCatalogHydrated = (): Promise<void> => {
+        if (isCatalogCached()) return Promise.resolve();
+        if (!hydrationPromise) {
+            hydrationPromise = (async () => {
+                try {
+                    const persisted = await storage.local.get<CodexModelInfo[]>(MODELS_CACHE_KEY);
+                    // Re-check isCatalogCached(): a live fetch may have landed
+                    // while the storage read was in flight — never clobber fresher
+                    // data with the persisted snapshot.
+                    if (Array.isArray(persisted) && persisted.length > 0 && !isCatalogCached()) {
+                        setCachedModels(persisted);
+                        logger.info(`Hydrated ${persisted.length} Codex models from storage`);
+                    }
+                } catch (err) {
+                    logger.warn('Failed to hydrate Codex catalog from storage:', err);
+                }
+            })();
+        }
+        return hydrationPromise;
+    };
+
+    /** Persist the fetched catalog so it survives restarts. Non-blocking. */
+    const persistModelCatalog = (models: CodexModelInfo[]): void => {
+        void storage.local.set(MODELS_CACHE_KEY, models).catch(err =>
+            logger.warn('Failed to persist Codex model catalog:', err),
+        );
+    };
+
+    /**
+     * Fetch the live catalog from the Codex API, update the in-memory cache and
+     * persist it. Returns the models on success, or null when unavailable (no
+     * account / network error / empty response) so callers can fall back to the
+     * cached-or-bundled catalog.
+     */
+    const refreshModelCatalog = async (): Promise<CodexModelInfo[] | null> => {
+        const accountId = tokenStore.getAccountId();
+        if (!accountId) return null;
+        try {
+            const accessToken = await tokenStore.getValidAccessToken();
+            const response = await globalThis.fetch(
+                `${CODEX_BASE_URL}/codex/models?client_version=1.0.0`,
+                {
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        [OPENAI_HEADERS.ACCOUNT_ID]: accountId,
+                        [OPENAI_HEADERS.ORIGINATOR]: 'codex_cli_rs',
+                        [OPENAI_HEADERS.BETA]: 'responses=experimental',
+                        'User-Agent': CODEX_USER_AGENT,
+                    },
+                },
+            );
+
+            if (!response.ok) {
+                logger.warn(`Failed to fetch models: ${response.status}`);
+                return null;
+            }
+
+            const data = await response.json();
+            const models = buildModelsFromApiResponse(data);
+            if (models.length === 0) {
+                logger.warn('No models found in API response');
+                return null;
+            }
+
+            setCachedModels(models);
+            persistModelCatalog(models);
+            logger.info(`Fetched and cached ${models.length} models from Codex API`);
+            return models;
+        } catch (error) {
+            logger.error('Error fetching models:', error);
+            return null;
+        }
+    };
+
+    /**
+     * Map a model's backend reasoning levels to the composer's thinking-selector
+     * vocabulary. 'off' is always available (handled separately), so only
+     * low..ultra are listed; 'minimal' (which Alma lacks) maps to the nearest
+     * 'low'. Returns undefined when unknown, so the composer falls back to its
+     * default level set. Order is canonical low→ultra.
+     */
+    const COMPOSER_LEVEL_ORDER = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+    const toComposerReasoningLevels = (levels?: CodexModelInfo['supportedReasoningLevels']): string[] | undefined => {
+        if (!levels || levels.length === 0) return undefined;
+        const mapped = new Set(levels.map(l => (l === 'minimal' ? 'low' : l)));
+        const ordered = COMPOSER_LEVEL_ORDER.filter(l => mapped.has(l as CodexModelInfo['reasoning']));
+        return ordered.length ? ordered : undefined;
+    };
+
+    /**
+     * Map the internal catalog to the provider's ProviderModelInfo shape.
+     * Reasoning variants (gpt-5.5-high/-low/-xhigh, …) are collapsed into their
+     * base model — the composer's model-aware thinking selector drives the effort
+     * now (including max/ultra) — so the picker shows a single entry per model.
+     */
+    const toProviderModels = (models: CodexModelInfo[]) => [
+        ...collapseReasoningVariants(models).map(model => ({
+            id: model.id,
+            name: model.name,
+            description: model.description,
+            contextWindow: model.contextWindow,
+            maxOutputTokens: model.maxOutputTokens,
+            capabilities: {
+                streaming: true,
+                reasoning: model.reasoning !== 'none',
+                functionCalling: true,
+                // Per-model supported thinking levels (Alma vocab: 'off' is always
+                // available and handled separately, so only low..ultra are listed).
+                // Lets the composer render a model-aware thinking selector.
+                reasoningLevels: toComposerReasoningLevels(model.supportedReasoningLevels),
+            },
+            providerOptions: {
+                reasoning: model.reasoning,
+                baseModel: model.baseModel,
+            },
+        })),
+        // The /codex/models catalog only lists chat models; image models live on
+        // the Images API and are appended manually.
+        ...imageModelEntries(),
+    ];
+
     const providerDisposable = providers.register({
         id: 'openai-codex',
         name: 'OpenAI Codex (ChatGPT)',
@@ -578,6 +914,18 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
         async initialize() {
             logger.info('Codex provider initialized');
+
+            // Restore the last-fetched catalog before any getModels() call so
+            // cold starts serve real capabilities for models newer than the
+            // bundled snapshot (e.g. gpt-5.5) instead of all-false defaults.
+            // getModels() also self-hydrates via the same guard, so this is a
+            // best-effort warm-up rather than the sole load path.
+            await ensureCatalogHydrated();
+
+            // Refresh the catalog in the background so capabilities load
+            // automatically on startup — no manual "Fetch" needed — and brand
+            // new backend models are picked up. Non-blocking.
+            void refreshModelCatalog();
 
             // Warm quota + profile caches in the background so the settings
             // page shows fresh data the first time it renders. Non-blocking.
@@ -690,81 +1038,21 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         },
 
         async getModels() {
-            return getActiveModels().map(model => ({
-                id: model.id,
-                name: model.name,
-                description: model.description,
-                contextWindow: model.contextWindow,
-                maxOutputTokens: model.maxOutputTokens,
-                capabilities: {
-                    streaming: true,
-                    reasoning: model.reasoning !== 'none',
-                    functionCalling: true,
-                },
-                providerOptions: {
-                    reasoning: model.reasoning,
-                    baseModel: model.baseModel,
-                },
-            }));
+            // Self-hydrate so the very first call after a cold start / reload
+            // returns the persisted catalog (real capabilities) instead of the
+            // stale bundled snapshot — independent of initialize() ordering.
+            await ensureCatalogHydrated();
+            return toProviderModels(getActiveModels());
         },
 
         async fetchModels() {
             logger.info('Fetching available models from Codex API...');
-            try {
-                const accessToken = await tokenStore.getValidAccessToken();
-                const accountId = tokenStore.getAccountId();
-                if (!accountId) {
-                    logger.warn('No account ID, returning default models');
-                    return this.getModels();
-                }
-
-                const response = await globalThis.fetch(
-                    `${CODEX_BASE_URL}/codex/models?client_version=1.0.0`,
-                    {
-                        headers: {
-                            'Authorization': `Bearer ${accessToken}`,
-                            [OPENAI_HEADERS.ACCOUNT_ID]: accountId,
-                            [OPENAI_HEADERS.ORIGINATOR]: 'codex_cli_rs',
-                            [OPENAI_HEADERS.BETA]: 'responses=experimental',
-                        },
-                    },
-                );
-
-                if (!response.ok) {
-                    logger.warn(`Failed to fetch models: ${response.status}`);
-                    return this.getModels();
-                }
-
-                const data = await response.json();
-                const models = buildModelsFromApiResponse(data);
-                if (models.length === 0) {
-                    logger.warn('No models found in API response');
-                    return this.getModels();
-                }
-
-                setCachedModels(models);
-                logger.info(`Fetched and cached ${models.length} models from Codex API`);
-
-                return models.map(model => ({
-                    id: model.id,
-                    name: model.name,
-                    description: model.description,
-                    contextWindow: model.contextWindow,
-                    maxOutputTokens: model.maxOutputTokens,
-                    capabilities: {
-                        streaming: true,
-                        reasoning: model.reasoning !== 'none',
-                        functionCalling: true,
-                    },
-                    providerOptions: {
-                        reasoning: model.reasoning,
-                        baseModel: model.baseModel,
-                    },
-                }));
-            } catch (error) {
-                logger.error('Error fetching models:', error);
-                return this.getModels();
-            }
+            // refreshModelCatalog updates + persists the cache; on any failure
+            // it returns null and we fall back to the cached-or-bundled catalog
+            // (hydrated from storage rather than the raw snapshot).
+            const models = await refreshModelCatalog();
+            if (!models) await ensureCatalogHydrated();
+            return toProviderModels(models ?? getActiveModels());
         },
 
         /**

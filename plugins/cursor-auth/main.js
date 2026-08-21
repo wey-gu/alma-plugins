@@ -4408,6 +4408,7 @@ var RequestContextSchema = /* @__PURE__ */ messageDesc(file_agent, 347);
 var SelectedImageSchema = /* @__PURE__ */ messageDesc(file_agent, 349);
 var SelectedContextSchema = /* @__PURE__ */ messageDesc(file_agent, 373);
 var ShellResultSchema = /* @__PURE__ */ messageDesc(file_agent, 389);
+var ShellStreamSchema = /* @__PURE__ */ messageDesc(file_agent, 395);
 var ShellRejectedSchema = /* @__PURE__ */ messageDesc(file_agent, 400);
 var WriteResultSchema = /* @__PURE__ */ messageDesc(file_agent, 450);
 var WriteRejectedSchema = /* @__PURE__ */ messageDesc(file_agent, 455);
@@ -4432,10 +4433,226 @@ var FALLBACK_MODELS = [
 ];
 async function getCursorModels(apiKey) {
   const discovered = await fetchCursorUsableModels(apiKey);
-  return discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
+  if (discovered && discovered.length > 0) {
+    updateCatalog(discovered);
+    catalogListener?.(discovered);
+    return discovered;
+  }
+  return cachedCatalog.length > 0 ? cachedCatalog : FALLBACK_MODELS;
 }
 function getFallbackModels() {
-  return FALLBACK_MODELS;
+  return cachedCatalog.length > 0 ? cachedCatalog : FALLBACK_MODELS;
+}
+var cachedCatalog = [];
+var catalogListener;
+var variantGroups = new Map;
+function setCatalogListener(listener) {
+  catalogListener = listener;
+}
+function hydrateCatalog(models) {
+  if (!Array.isArray(models) || models.length === 0 || cachedCatalog.length > 0)
+    return;
+  const valid = models.filter((m) => m && typeof m.id === "string" && m.id.length > 0);
+  if (valid.length > 0)
+    updateCatalog(valid);
+}
+function updateCatalog(models) {
+  cachedCatalog = models;
+  variantGroups = buildVariantGroups(models);
+}
+var COMPOSER_LEVEL_ORDER = ["low", "medium", "high", "xhigh", "max", "ultra"];
+var EFFORT_SUFFIXES = [
+  ["extra-high", "xhigh"],
+  ["xhigh", "xhigh"],
+  ["minimal", "low"],
+  ["medium", "medium"],
+  ["ultra", "ultra"],
+  ["none", "none"],
+  ["high", "high"],
+  ["low", "low"],
+  ["max", "max"]
+];
+function parseVariantId(model) {
+  let rest = model.id;
+  let thinking = false;
+  let fast = false;
+  let effort;
+  for (;; ) {
+    if (!fast && rest.endsWith("-fast")) {
+      fast = true;
+      rest = rest.slice(0, -"-fast".length);
+      continue;
+    }
+    if (!thinking && rest.endsWith("-thinking")) {
+      thinking = true;
+      rest = rest.slice(0, -"-thinking".length);
+      continue;
+    }
+    if (effort === undefined) {
+      const match = EFFORT_SUFFIXES.find(([suffix]) => rest.endsWith(`-${suffix}`));
+      if (match) {
+        effort = match[1];
+        rest = rest.slice(0, -(match[0].length + 1));
+        continue;
+      }
+    }
+    break;
+  }
+  return { model, base: rest, thinking, fast, effort };
+}
+function buildVariantGroups(models) {
+  const byGroup = new Map;
+  for (const model of models) {
+    const info = parseVariantId(model);
+    const key = `${info.base}${info.fast ? "\x00fast" : ""}`;
+    const list = byGroup.get(key);
+    if (list)
+      list.push(info);
+    else
+      byGroup.set(key, [info]);
+  }
+  const groups = new Map;
+  for (const members of byGroup.values()) {
+    if (members.length < 2)
+      continue;
+    const { base, fast } = members[0];
+    const bareBase = members.find((m) => !m.thinking && !m.fast && m.effort === undefined && m.model.id === base);
+    const collapsedId = bareBase ? base : fast ? `${base}-fast` : base;
+    const nonThinking = members.filter((m) => !m.thinking);
+    const namePool = nonThinking.length > 0 ? nonThinking : members;
+    const defaultMember = pickDefaultMember(namePool);
+    const offMember = nonThinking.find((m) => m.effort === "none") ?? defaultMember;
+    const thinkingMembers = members.filter((m) => m.thinking);
+    const effortPool = thinkingMembers.length > 0 ? thinkingMembers : nonThinking;
+    const byEffort = new Map;
+    for (const m of effortPool) {
+      if (m.effort && m.effort !== "none" && !byEffort.has(m.effort)) {
+        byEffort.set(m.effort, m.model.id);
+      }
+    }
+    const thinkingDefaultId = thinkingMembers.find((m) => m.effort === undefined)?.model.id;
+    groups.set(collapsedId, {
+      id: collapsedId,
+      members,
+      defaultId: defaultMember.model.id,
+      offId: offMember.model.id,
+      byEffort,
+      thinkingDefaultId
+    });
+  }
+  return groups;
+}
+var EFFORT_DISPLAY_WORDS = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra High",
+  max: "Max",
+  none: "None",
+  ultra: "Ultra"
+};
+function nameCarriesOwnEffort(member) {
+  if (!member.effort)
+    return false;
+  const word = EFFORT_DISPLAY_WORDS[member.effort];
+  if (!word)
+    return false;
+  return new RegExp(`\\b${word}\\b`, "i").test(member.model.name);
+}
+var DEFAULT_EFFORT_PREFERENCE = ["medium", "high", "low", "xhigh", "max", "none"];
+function pickDefaultMember(pool) {
+  const unmarked = pool.filter((m) => !nameCarriesOwnEffort(m));
+  if (unmarked.length > 0) {
+    return unmarked.reduce((a, b) => b.model.name.length < a.model.name.length ? b : a);
+  }
+  for (const effort of DEFAULT_EFFORT_PREFERENCE) {
+    const match = pool.find((m) => m.effort === effort);
+    if (match)
+      return match;
+  }
+  return pool.reduce((a, b) => b.model.name.length < a.model.name.length ? b : a);
+}
+function collapsedDisplayName(member) {
+  if (!nameCarriesOwnEffort(member))
+    return member.model.name;
+  const word = EFFORT_DISPLAY_WORDS[member.effort];
+  return member.model.name.replace(new RegExp(`\\s*\\b${word}\\b`, "i"), "").replace(/\s{2,}/g, " ").trim();
+}
+function collapseCursorModels(models) {
+  const groups = buildVariantGroups(models);
+  const groupByMemberId = new Map;
+  for (const group of groups.values()) {
+    for (const m of group.members)
+      groupByMemberId.set(m.model.id, group);
+  }
+  const collapsed = [];
+  const emitted = new Set;
+  for (const model of models) {
+    const group = groupByMemberId.get(model.id);
+    if (!group) {
+      collapsed.push({ ...model, variantCount: 1 });
+      continue;
+    }
+    if (emitted.has(group.id))
+      continue;
+    emitted.add(group.id);
+    const defaultMember = group.members.find((m) => m.model.id === group.defaultId);
+    const levels = COMPOSER_LEVEL_ORDER.filter((l) => group.byEffort.has(l));
+    collapsed.push({
+      id: group.id,
+      name: collapsedDisplayName(defaultMember),
+      reasoning: group.members.some((m) => m.thinking) || levels.length > 0 || group.members.some((m) => m.model.reasoning),
+      contextWindow: Math.max(...group.members.map((m) => m.model.contextWindow)),
+      maxTokens: Math.max(...group.members.map((m) => m.model.maxTokens)),
+      reasoningLevels: levels.length > 0 ? levels : undefined,
+      variantCount: group.members.length
+    });
+  }
+  return collapsed;
+}
+function resolveCursorModelId(modelId, reasoningEffort) {
+  const group = variantGroups.get(modelId);
+  if (!group)
+    return modelId;
+  const effort = normalizeEffort(reasoningEffort);
+  if (effort === undefined)
+    return group.defaultId;
+  if (effort === "off")
+    return group.offId;
+  const exact = group.byEffort.get(effort);
+  if (exact)
+    return exact;
+  const nearest = nearestLevel(effort, [...group.byEffort.keys()]);
+  if (nearest)
+    return group.byEffort.get(nearest);
+  return group.thinkingDefaultId ?? group.defaultId;
+}
+function normalizeEffort(effort) {
+  if (typeof effort !== "string" || effort.length === 0)
+    return;
+  const lower = effort.toLowerCase();
+  if (lower === "off" || lower === "none")
+    return "off";
+  if (lower === "minimal")
+    return "low";
+  if (lower === "extra-high")
+    return "xhigh";
+  return COMPOSER_LEVEL_ORDER.includes(lower) ? lower : undefined;
+}
+function nearestLevel(target, available) {
+  const targetIdx = COMPOSER_LEVEL_ORDER.indexOf(target);
+  let best;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const level of COMPOSER_LEVEL_ORDER) {
+    if (!available.includes(level))
+      continue;
+    const distance = Math.abs(COMPOSER_LEVEL_ORDER.indexOf(level) - targetIdx);
+    if (distance < bestDistance) {
+      best = level;
+      bestDistance = distance;
+    }
+  }
+  return best;
 }
 async function fetchCursorUsableModels(apiKey) {
   try {
@@ -4594,6 +4811,25 @@ var CURSOR_API_URL = "https://api2.cursor.sh";
 var CURSOR_CLIENT_VERSION2 = "cli-2026.02.13-41ac335";
 var CONNECT_END_STREAM_FLAG = 2;
 var activeSessions = new Map;
+function registerBridge(bridge, keys) {
+  bridge.keys = keys;
+  for (const k of keys)
+    activeSessions.set(k, bridge);
+}
+function deleteBridge(bridge) {
+  for (const k of bridge.keys) {
+    if (activeSessions.get(k) === bridge)
+      activeSessions.delete(k);
+  }
+}
+function bridgeKeysFor(sessionKey, execs) {
+  const keys = [sessionKey];
+  for (const e of execs) {
+    if (e.toolCallId)
+      keys.push(`tc:${e.toolCallId}`);
+  }
+  return keys;
+}
 var sessionGcTimer;
 var SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 function destroySession(session) {
@@ -4601,16 +4837,13 @@ function destroySession(session) {
   try {
     session.h2Stream.close();
   } catch {}
-  try {
-    session.h2Client.close();
-  } catch {}
 }
 function gcStaleSessions() {
   const now = Date.now();
-  for (const [key, session] of activeSessions) {
+  for (const session of new Set(activeSessions.values())) {
     if (now - session.lastActiveAt > SESSION_IDLE_TIMEOUT_MS) {
       destroySession(session);
-      activeSessions.delete(key);
+      deleteBridge(session);
     }
   }
 }
@@ -4672,10 +4905,11 @@ function stopProxy() {
     clearInterval(sessionGcTimer);
     sessionGcTimer = undefined;
   }
-  for (const [key, session] of activeSessions) {
+  for (const session of new Set(activeSessions.values())) {
     destroySession(session);
-    activeSessions.delete(key);
   }
+  activeSessions.clear();
+  dropSharedH2Session();
 }
 function createProxyFetch() {
   return async (input, init) => {
@@ -4703,7 +4937,10 @@ function readBody(req) {
 }
 function handleChatCompletion(body, accessToken, res, logger) {
   const { systemPrompt, userText, images, turns, toolResults } = parseMessages(body.messages);
-  const modelId = body.model;
+  const modelId = resolveCursorModelId(body.model, body.reasoning_effort);
+  if (modelId !== body.model) {
+    logger.debug(`Cursor proxy: resolved ${body.model} (effort=${body.reasoning_effort ?? "default"}) -> ${modelId}`);
+  }
   const tools = body.tools ?? [];
   if (!userText && toolResults.length === 0) {
     res.writeHead(400, { "Content-Type": "application/json" });
@@ -4711,15 +4948,26 @@ function handleChatCompletion(body, accessToken, res, logger) {
     return;
   }
   const sessionKey = deriveSessionKey(modelId, body.messages);
-  const activeSession = activeSessions.get(sessionKey);
+  let activeSession;
+  for (const r of toolResults) {
+    if (!r.toolCallId)
+      continue;
+    const b = activeSessions.get(`tc:${r.toolCallId}`);
+    if (b) {
+      activeSession = b;
+      break;
+    }
+  }
+  if (!activeSession)
+    activeSession = activeSessions.get(sessionKey);
   if (activeSession && toolResults.length > 0) {
-    activeSessions.delete(sessionKey);
+    deleteBridge(activeSession);
     resumeWithToolResults(activeSession, toolResults, modelId, sessionKey, res);
     return;
   }
   if (activeSession) {
     destroySession(activeSession);
-    activeSessions.delete(sessionKey);
+    deleteBridge(activeSession);
   }
   let effectiveUserText = userText;
   if (!effectiveUserText && toolResults.length > 0) {
@@ -4750,12 +4998,27 @@ ${effectiveUserText}`;
     }
   }
   const mcpTools = buildMcpToolDefinitions(tools);
-  const payload = buildCursorRequest(modelId, systemPrompt, effectiveUserText, images);
+  const isStreaming = body.stream === true;
+  const isUtilityCall = !isStreaming && mcpTools.length === 0;
+  const mode = isUtilityCall ? AGENT_MODE_ASK : undefined;
+  let promptSystem = systemPrompt;
+  let promptUser = effectiveUserText;
+  if (isUtilityCall && systemPrompt) {
+    promptUser = `<instructions>
+${systemPrompt}
+</instructions>
+
+${effectiveUserText}
+
+(Follow <instructions> exactly. Do NOT attempt to execute the task yourself — no tools.)`;
+    promptSystem = "";
+  }
+  const payload = buildCursorRequest(modelId, promptSystem, promptUser, images, mode);
   payload.mcpTools = mcpTools;
-  if (body.stream === false) {
-    handleNonStreaming(payload, accessToken, modelId, res, logger);
-  } else {
+  if (isStreaming) {
     handleStreaming(payload, accessToken, modelId, sessionKey, res);
+  } else {
+    handleNonStreaming(payload, accessToken, modelId, res, logger);
   }
 }
 function extractContent(content) {
@@ -4885,12 +5148,33 @@ ${text}` : text;
   }
   return { systemPrompt, userText: lastUserText, images, turns, toolResults };
 }
+var CURSOR_RESERVED_TOOL_NAMES = new Set([
+  "Task",
+  "TodoWrite",
+  "Read",
+  "Write",
+  "Glob",
+  "Grep",
+  "WebSearch",
+  "WebFetch"
+]);
+var RESERVED_TOOL_PREFIX = "alma_";
+function encodeToolName(name) {
+  return CURSOR_RESERVED_TOOL_NAMES.has(name) ? RESERVED_TOOL_PREFIX + name : name;
+}
+function decodeToolName(name) {
+  if (!name.startsWith(RESERVED_TOOL_PREFIX))
+    return name;
+  const stripped = name.slice(RESERVED_TOOL_PREFIX.length);
+  return CURSOR_RESERVED_TOOL_NAMES.has(stripped) ? stripped : name;
+}
 function buildMcpToolDefinitions(tools) {
   return tools.map((t) => {
     const fn = t.function;
     const jsonSchema = fn.parameters && typeof fn.parameters === "object" ? fn.parameters : { type: "object", properties: {}, required: [] };
     const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, jsonSchema));
-    return create(McpToolDefinitionSchema, { name: fn.name, description: fn.description || "", providerIdentifier: "alma", toolName: fn.name, inputSchema });
+    const wireName = encodeToolName(fn.name);
+    return create(McpToolDefinitionSchema, { name: wireName, description: fn.description || "", providerIdentifier: "alma", toolName: wireName, inputSchema });
   });
 }
 function decodeMcpArgValue(value) {
@@ -4905,7 +5189,8 @@ function decodeMcpArgsMap(args) {
     decoded[key] = decodeMcpArgValue(value);
   return decoded;
 }
-function buildCursorRequest(modelId, systemPrompt, userText, images) {
+var AGENT_MODE_ASK = 2;
+function buildCursorRequest(modelId, systemPrompt, userText, images, mode) {
   const blobStore = new Map;
   const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
   const systemBytes = new TextEncoder().encode(systemJson);
@@ -4923,7 +5208,8 @@ function buildCursorRequest(modelId, systemPrompt, userText, images) {
     turnTimings: [],
     subagentStates: {},
     selfSummaryCount: 0,
-    readPaths: []
+    readPaths: [],
+    ...mode !== undefined && { mode }
   });
   const userMessage = create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() });
   if (images.length > 0) {
@@ -4953,19 +5239,85 @@ function parseConnectEndStream(data) {
   try {
     const p = JSON.parse(new TextDecoder().decode(data));
     if (p?.error)
-      return new Error(`Connect error ${p.error.code ?? "unknown"}: ${p.error.message ?? "Unknown"}`);
+      return new Error(formatConnectError(p.error));
     return null;
   } catch {
     return new Error("Failed to parse Connect end stream");
   }
 }
+function formatConnectError(error) {
+  const code = error.code ?? "unknown";
+  let message = error.message ?? "Unknown";
+  const details = Array.isArray(error.details) ? error.details : [];
+  for (const d of details) {
+    const debug = d?.debug;
+    const dd = debug?.details;
+    if (dd?.title || dd?.detail) {
+      message = [dd.title, dd.detail].filter(Boolean).join(" — ");
+      const buttons = Array.isArray(dd.buttons) ? dd.buttons : [];
+      const urls = buttons.map((b) => b?.url?.url).filter(Boolean);
+      if (urls.length > 0)
+        message += ` (see ${urls.join(", ")})`;
+      if (buttons.some((b) => b?.dashboardAction)) {
+        message += " — open Cursor IDE, select this model once and accept the prompt, then retry here.";
+      }
+      break;
+    }
+    if (typeof debug?.error === "string" && debug.error) {
+      message = message === "Error" ? debug.error : `${message} (${debug.error})`;
+    }
+  }
+  return `Connect error ${code}: ${message}`;
+}
 function makeHeartbeatBytes() {
   return frameConnectMessage(toBinary(AgentClientMessageSchema, create(AgentClientMessageSchema, { message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) } })));
 }
-function createH2Stream(accessToken) {
-  const client = http22.connect(CURSOR_API_URL);
-  client.on("error", () => {});
-  const stream = client.request({
+var sharedH2Session;
+var sharedH2KeepAlive;
+function dropSharedH2Session() {
+  if (sharedH2KeepAlive) {
+    clearInterval(sharedH2KeepAlive);
+    sharedH2KeepAlive = undefined;
+  }
+  const s = sharedH2Session;
+  sharedH2Session = undefined;
+  if (s) {
+    try {
+      s.close();
+    } catch {}
+  }
+}
+function getSharedH2Session() {
+  if (sharedH2Session && !sharedH2Session.closed && !sharedH2Session.destroyed) {
+    return sharedH2Session;
+  }
+  if (sharedH2Session)
+    dropSharedH2Session();
+  const session = http22.connect(CURSOR_API_URL);
+  sharedH2Session = session;
+  const forget = () => {
+    if (sharedH2Session === session)
+      dropSharedH2Session();
+  };
+  session.on("error", forget);
+  session.on("close", forget);
+  session.on("goaway", forget);
+  sharedH2KeepAlive = setInterval(() => {
+    if (session.closed || session.destroyed) {
+      forget();
+      return;
+    }
+    try {
+      session.ping(() => {});
+    } catch {
+      forget();
+    }
+  }, 30000);
+  sharedH2KeepAlive.unref?.();
+  return session;
+}
+function openH2Stream(session, accessToken) {
+  return session.request({
     ":method": "POST",
     ":path": "/agent.v1.AgentService/Run",
     "content-type": "application/connect+proto",
@@ -4977,7 +5329,16 @@ function createH2Stream(accessToken) {
     "x-cursor-client-type": "cli",
     "x-request-id": crypto.randomUUID()
   });
-  return { client, stream };
+}
+function createH2Stream(accessToken) {
+  let session = getSharedH2Session();
+  try {
+    return { client: session, stream: openH2Stream(session, accessToken) };
+  } catch {
+    dropSharedH2Session();
+    session = getSharedH2Session();
+    return { client: session, stream: openH2Stream(session, accessToken) };
+  }
 }
 function processServerMessage(msg, blobStore, mcpTools, sendFrame, state, onText, onMcpExec) {
   const c = msg.message.case;
@@ -5005,13 +5366,13 @@ function handleKvMessage(kv, blobStore, sendFrame) {
 }
 function handleExecMessage(exec, mcpTools, sendFrame, onMcpExec) {
   const c = exec.message.case;
-  const R = "Tool not available in this environment. Use the MCP tools provided instead.";
+  const R = mcpTools.length > 0 ? "Tool not available in this environment. Use the MCP tools provided instead." : "Tool not available in this environment. Do not retry tools — answer directly in your final message.";
   if (c === "requestContextArgs") {
     const ctx = create(RequestContextSchema, { rules: [], repositoryInfo: [], tools: mcpTools, gitRepos: [], projectLayouts: [], mcpInstructions: [], fileContents: {}, customSubagents: [] });
     sendExec(exec, "requestContextResult", create(RequestContextResultSchema, { result: { case: "success", value: create(RequestContextSuccessSchema, { requestContext: ctx }) } }), sendFrame);
   } else if (c === "mcpArgs") {
     const a = exec.message.value;
-    onMcpExec({ execId: exec.execId, execMsgId: exec.id, toolCallId: a.toolCallId || crypto.randomUUID(), toolName: a.toolName || a.name, decodedArgs: JSON.stringify(decodeMcpArgsMap(a.args ?? {})) });
+    onMcpExec({ execId: exec.execId, execMsgId: exec.id, toolCallId: a.toolCallId || crypto.randomUUID(), toolName: decodeToolName(a.toolName || a.name), decodedArgs: JSON.stringify(decodeMcpArgsMap(a.args ?? {})) });
   } else if (c === "readArgs")
     sendExec(exec, "readResult", create(ReadResultSchema, { result: { case: "rejected", value: create(ReadRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
   else if (c === "lsArgs")
@@ -5022,9 +5383,12 @@ function handleExecMessage(exec, mcpTools, sendFrame, onMcpExec) {
     sendExec(exec, "writeResult", create(WriteResultSchema, { result: { case: "rejected", value: create(WriteRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
   else if (c === "deleteArgs")
     sendExec(exec, "deleteResult", create(DeleteResultSchema, { result: { case: "rejected", value: create(DeleteRejectedSchema, { path: exec.message.value.path, reason: R }) } }), sendFrame);
-  else if (c === "shellArgs" || c === "shellStreamArgs") {
+  else if (c === "shellArgs") {
     const a = exec.message.value;
     sendExec(exec, "shellResult", create(ShellResultSchema, { result: { case: "rejected", value: create(ShellRejectedSchema, { command: a.command ?? "", workingDirectory: a.workingDirectory ?? "", reason: R, isReadonly: false }) } }), sendFrame);
+  } else if (c === "shellStreamArgs") {
+    const a = exec.message.value;
+    sendExec(exec, "shellStream", create(ShellStreamSchema, { event: { case: "rejected", value: create(ShellRejectedSchema, { command: a.command ?? "", workingDirectory: a.workingDirectory ?? "", reason: R, isReadonly: false }) } }), sendFrame);
   } else if (c === "backgroundShellSpawnArgs") {
     const a = exec.message.value;
     sendExec(exec, "backgroundShellSpawnResult", create(BackgroundShellSpawnResultSchema, { result: { case: "rejected", value: create(ShellRejectedSchema, { command: a.command ?? "", workingDirectory: a.workingDirectory ?? "", reason: R, isReadonly: false }) } }), sendFrame);
@@ -5053,23 +5417,39 @@ function handleStreaming(payload, accessToken, modelId, sessionKey, res) {
   const created = Math.floor(Date.now() / 1000);
   res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
   let closed = false;
+  res.on("close", () => {
+    closed = true;
+  });
+  res.on("error", () => {
+    closed = true;
+  });
   const sse = (d) => {
     if (!closed)
-      res.write(`data: ${JSON.stringify(d)}
+      try {
+        res.write(`data: ${JSON.stringify(d)}
 
 `);
+      } catch {
+        closed = true;
+      }
   };
   const done = () => {
     if (!closed)
-      res.write(`data: [DONE]
+      try {
+        res.write(`data: [DONE]
 
 `);
+      } catch {
+        closed = true;
+      }
   };
   const end = () => {
     if (closed)
       return;
     closed = true;
-    res.end();
+    try {
+      res.end();
+    } catch {}
   };
   const chunk = (delta, finish = null) => ({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta, finish_reason: finish }] });
   const state = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
@@ -5086,7 +5466,6 @@ function handleStreaming(payload, accessToken, modelId, sessionKey, res) {
   h2Stream.on("data", processData);
   h2Stream.on("end", () => {
     clearInterval(heartbeatTimer);
-    h2Client.close();
     if (!mcpExecReceived) {
       if (state.thinkingActive)
         sse(chunk({ content: "</think>" }));
@@ -5098,7 +5477,7 @@ function handleStreaming(payload, accessToken, modelId, sessionKey, res) {
   h2Stream.on("error", () => {
     clearInterval(heartbeatTimer);
     try {
-      h2Client.close();
+      h2Stream.close();
     } catch {}
     if (!mcpExecReceived) {
       sse(chunk({}, "stop"));
@@ -5151,7 +5530,8 @@ function buildStreamProcessor(h2Stream, payload, state, chunk, sse, done, end, h
             state.thinkingActive = false;
           }
           sse(chunk({ tool_calls: [{ index: state.toolCallIndex++, id: exec.toolCallId, type: "function", function: { name: exec.toolName, arguments: exec.decodedArgs } }] }));
-          activeSessions.set(sessionKey, { h2Client, h2Stream, heartbeatTimer, blobStore: payload.blobStore, mcpTools: payload.mcpTools, pendingExecs: state.pendingExecs, lastActiveAt: Date.now() });
+          const bridge = { h2Client, h2Stream, heartbeatTimer, blobStore: payload.blobStore, mcpTools: payload.mcpTools, pendingExecs: state.pendingExecs, lastActiveAt: Date.now(), keys: [] };
+          registerBridge(bridge, bridgeKeysFor(sessionKey, state.pendingExecs));
           sse(chunk({}, "tool_calls"));
           done();
           end();
@@ -5176,23 +5556,39 @@ function resumeWithToolResults(session, toolResults, modelId, sessionKey, res) {
   const created = Math.floor(Date.now() / 1000);
   res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
   let closed = false;
+  res.on("close", () => {
+    closed = true;
+  });
+  res.on("error", () => {
+    closed = true;
+  });
   const sse = (d) => {
     if (!closed)
-      res.write(`data: ${JSON.stringify(d)}
+      try {
+        res.write(`data: ${JSON.stringify(d)}
 
 `);
+      } catch {
+        closed = true;
+      }
   };
   const done = () => {
     if (!closed)
-      res.write(`data: [DONE]
+      try {
+        res.write(`data: [DONE]
 
 `);
+      } catch {
+        closed = true;
+      }
   };
   const end = () => {
     if (closed)
       return;
     closed = true;
-    res.end();
+    try {
+      res.end();
+    } catch {}
   };
   const chunk = (delta, finish = null) => ({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta, finish_reason: finish }] });
   const state = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
@@ -5203,7 +5599,6 @@ function resumeWithToolResults(session, toolResults, modelId, sessionKey, res) {
   h2Stream.on("data", processData);
   h2Stream.on("end", () => {
     clearInterval(heartbeatTimer);
-    h2Client.close();
     if (!mcpExecReceived) {
       if (state.thinkingActive)
         sse(chunk({ content: "</think>" }));
@@ -5215,7 +5610,7 @@ function resumeWithToolResults(session, toolResults, modelId, sessionKey, res) {
   h2Stream.on("error", () => {
     clearInterval(heartbeatTimer);
     try {
-      h2Client.close();
+      h2Stream.close();
     } catch {}
     if (!mcpExecReceived) {
       sse(chunk({}, "stop"));
@@ -5237,21 +5632,28 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
   let pendingBuffer = Buffer.alloc(0);
   const collectedToolCalls = [];
   let responded = false;
+  let endStreamError = null;
   const state = { thinkingActive: false, toolCallIndex: 0, pendingExecs: [] };
   const cleanup = () => {
     clearInterval(heartbeatTimer);
     try {
       h2Stream.close();
     } catch {}
-    try {
-      h2Client.close();
-    } catch {}
   };
+  res.on("error", () => {});
+  res.on("close", () => {
+    if (!responded) {
+      responded = true;
+      cleanup();
+    }
+  });
   const respond = (finishReason, errMessage) => {
     if (responded)
       return;
     responded = true;
     cleanup();
+    if (res.destroyed || res.headersSent)
+      return;
     res.writeHead(200, { "Content-Type": "application/json" });
     const message = { role: "assistant", content: fullText || null };
     if (collectedToolCalls.length > 0) {
@@ -5283,14 +5685,21 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
         break;
       const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
       pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-      if (flags & CONNECT_END_STREAM_FLAG)
+      if (flags & CONNECT_END_STREAM_FLAG) {
+        const e = parseConnectEndStream(messageBytes);
+        if (e) {
+          endStreamError = e;
+          logger.error("Cursor proxy non-stream end-stream error:", e.message);
+        }
         continue;
+      }
       try {
         processServerMessage(fromBinary(AgentServerMessageSchema, messageBytes), payload.blobStore, payload.mcpTools, (data) => {
           if (!h2Stream.closed && !h2Stream.destroyed)
             h2Stream.write(data);
-        }, state, (text) => {
-          fullText += text;
+        }, state, (text, isThinking) => {
+          if (!isThinking)
+            fullText += text;
         }, (exec) => {
           collectedToolCalls.push({
             id: exec.toolCallId,
@@ -5306,6 +5715,8 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
   h2Stream.on("end", () => {
     if (collectedToolCalls.length > 0)
       respond("tool_calls");
+    else if (endStreamError)
+      respond("error", endStreamError.message);
     else
       respond("stop");
   });
@@ -5313,15 +5724,65 @@ function handleNonStreaming(payload, accessToken, modelId, res, logger) {
     logger.error("Cursor proxy non-stream h2 error:", err);
     respond("error", err instanceof Error ? err.message : String(err));
   });
+  const turnDeadline = setTimeout(() => {
+    logger.warn("Cursor proxy non-stream turn exceeded 120s, responding with partial text");
+    respond("stop");
+  }, 120000);
+  turnDeadline.unref?.();
+  res.on("close", () => clearTimeout(turnDeadline));
 }
 
 // main.ts
 var DUMMY_API_KEY = "cursor-proxy";
+var MODELS_CACHE_KEY = "cursor-model-catalog-v1";
 async function activate(context) {
   const { logger, storage, providers, commands, ui } = context;
   logger.info("Cursor Auth plugin activating...");
   const tokenStore = new TokenStore(storage.secrets, logger);
   await tokenStore.initialize();
+  setCatalogListener((models) => {
+    storage.local.set(MODELS_CACHE_KEY, models).catch((err) => logger.warn("Failed to persist Cursor model catalog:", err));
+  });
+  const catalogHydration = (async () => {
+    try {
+      const persisted = await storage.local.get(MODELS_CACHE_KEY);
+      hydrateCatalog(persisted);
+      if (Array.isArray(persisted) && persisted.length > 0) {
+        logger.info(`Hydrated ${persisted.length} Cursor models from storage`);
+      }
+    } catch (err) {
+      logger.warn("Failed to hydrate Cursor model catalog from storage:", err);
+    }
+  })();
+  const toProviderModels = (models) => collapseCursorModels(models).map((model) => ({
+    id: model.id,
+    name: model.name,
+    description: model.variantCount > 1 ? `Cursor: ${model.name} — ${model.variantCount} effort variants merged; the thinking selector picks the tier` : `Cursor: ${model.name}${model.reasoning ? " (reasoning)" : ""}`,
+    contextWindow: model.contextWindow,
+    maxOutputTokens: model.maxTokens,
+    capabilities: {
+      temperature: true,
+      streaming: true,
+      reasoning: model.reasoning,
+      attachment: false,
+      functionCalling: true,
+      ...model.reasoningLevels ? { reasoningLevels: model.reasoningLevels } : {},
+      input: {
+        text: true,
+        audio: false,
+        image: true,
+        video: false,
+        pdf: false
+      },
+      output: {
+        text: true,
+        audio: false,
+        image: false,
+        video: false,
+        pdf: false
+      }
+    }
+  }));
   let currentProxyPort;
   const ensureProxy = async () => {
     if (currentProxyPort)
@@ -5370,77 +5831,27 @@ async function activate(context) {
       logger.info("Cursor logout successful");
     },
     async getModels() {
+      await catalogHydration;
       const tokens = tokenStore.getTokens();
       const models = tokens ? await getCursorModels(tokens.access_token).catch(() => getFallbackModels()) : getFallbackModels();
-      return models.map((model) => ({
-        id: model.id,
-        name: model.name,
-        description: `Cursor: ${model.name}${model.reasoning ? " (reasoning)" : ""}`,
-        contextWindow: model.contextWindow,
-        maxOutputTokens: model.maxTokens,
-        capabilities: {
-          temperature: true,
-          streaming: true,
-          reasoning: model.reasoning,
-          attachment: false,
-          functionCalling: true,
-          input: {
-            text: true,
-            audio: false,
-            image: true,
-            video: false,
-            pdf: false
-          },
-          output: {
-            text: true,
-            audio: false,
-            image: false,
-            video: false,
-            pdf: false
-          }
-        }
-      }));
+      return toProviderModels(models);
     },
     async fetchModels() {
       logger.info("Fetching available models from Cursor API...");
       try {
+        await catalogHydration;
         const accessToken = await tokenStore.getValidAccessToken();
         const models = await getCursorModels(accessToken);
-        logger.info(`Fetched ${models.length} models from Cursor API`);
-        return models.map((model) => ({
-          id: model.id,
-          name: model.name,
-          description: `Cursor: ${model.name}${model.reasoning ? " (reasoning)" : ""}`,
-          contextWindow: model.contextWindow,
-          maxOutputTokens: model.maxTokens,
-          capabilities: {
-            temperature: true,
-            streaming: true,
-            reasoning: model.reasoning,
-            attachment: false,
-            functionCalling: true,
-            input: {
-              text: true,
-              audio: false,
-              image: false,
-              video: false,
-              pdf: false
-            },
-            output: {
-              text: true,
-              audio: false,
-              image: false,
-              video: false,
-              pdf: false
-            }
-          }
-        }));
+        const collapsed = toProviderModels(models);
+        logger.info(`Fetched ${models.length} models from Cursor API (collapsed to ${collapsed.length} picker entries)`);
+        return collapsed;
       } catch (error) {
         logger.error("Error fetching models:", error);
         return this.getModels();
       }
     },
     async getSDKConfig() {
+      await catalogHydration;
       const port = await ensureProxy();
       return {
         apiKey: DUMMY_API_KEY,
